@@ -9866,9 +9866,59 @@ static BOOL SelfWrite(LPVOID addr, LPCVOID data, SIZE_T n, SIZE_T* wrote)
     return WriteProcessMemory(GetCurrentProcess(), addr, data, n, wrote);
 }
 
+// ---- page-checked direct reads (WinlatorXrReadCache, default on in this flavour) ----
+//
+// Headset measurements: ReadProcessMemory ~1.4 us a call and the mod makes 7,000-36,000 reads a
+// frame (10-50 ms); a plain SEH-guarded copy is 0.1 us but each FAULT under Box64 is so slow that
+// the object scan, which probes thousands of junk pointers, stalled. So a read is copied directly
+// only from a page VirtualQuery has confirmed readable, and a junk address is refused from the
+// cache without touching it. Entries (readable or not) expire every second, so a page that is
+// freed or committed later is re-checked; the SEH guard remains for the window in between.
+#if MEVR_WINLATORXR
+static bool g_readCache = true;
+#else
+static const bool g_readCache = false;
+#endif
+static volatile LONG g_readCacheQueries = 0;
+static const unsigned kReadCacheSlots = 1u << 14;
+// slot = page number << 12 | epoch << 1 | readable; 0 = empty. One aligned 32-bit store/load,
+// so concurrent threads see either the old or the new entry, never a torn one.
+static volatile uint32_t g_readCachePages[kReadCacheSlots];
+
+static uint32_t ReadCacheEpoch() { return (GetTickCount() >> 10) & 0x7FF; }
+
+static int ReadCachePage(uint32_t page, uint32_t epoch)   // 1 readable, 0 not
+{
+    const unsigned slot = (page ^ (page >> 14)) & (kReadCacheSlots - 1);
+    const uint32_t e = g_readCachePages[slot];
+    if (e && (e >> 12) == page && ((e >> 1) & 0x7FF) == epoch) return (int)(e & 1);
+    MEMORY_BASIC_INFORMATION mbi{};
+    int readable = 0;
+    g_readCacheQueries++;
+    if (VirtualQuery((LPCVOID)(uintptr_t)(page << 12), &mbi, sizeof(mbi)) == sizeof(mbi) &&
+        mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+        (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        readable = 1;
+    g_readCachePages[slot] = (page << 12) | (epoch << 1) | (uint32_t)readable;
+    return readable;
+}
+
+static bool SafeReadCached(uintptr_t addr, void* out, size_t n)
+{
+    if (!n) return true;
+    if (addr < 0x10000 || addr + n < addr || addr + n > 0xFFFF0000u) return false;
+    const uint32_t epoch = ReadCacheEpoch();
+    const uint32_t first = (uint32_t)(addr >> 12), last = (uint32_t)((addr + n - 1) >> 12);
+    for (uint32_t p = first; p <= last; ++p)
+        if (!ReadCachePage(p, epoch)) return false;
+    return SafeReadFast(addr, out, n);
+}
+
 static bool SafeRead(uintptr_t addr, void* out, size_t n)
 {
     g_safeReadCalls++;
+    if (g_readCache) return SafeReadCached(addr, out, n);
     if (g_fastSafeRead) return SafeReadFast(addr, out, n);
     SIZE_T got = 0;
     return ReadProcessMemory(GetCurrentProcess(), (LPCVOID)addr, out, n, &got) && got == n;
@@ -28055,6 +28105,14 @@ static void LoadSettingsFile()
             g_fastSelfWrite = b;
             Log("[cfg]   WinlatorXrFastWrite = %s  (%s)", b ? "on" : "off",
                 b ? "game memory written directly, WriteProcessMemory on a fault" : "game memory written through WriteProcessMemory");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrReadCache") == 0) {
+            if (!SettingBool(val, &b)) { Log("[cfg]   WinlatorXrReadCache = %s  (not on/off - ignored)", val); rejected++; continue; }
+            g_readCache = b;
+            Log("[cfg]   WinlatorXrReadCache = %s  (%s)", b ? "on" : "off",
+                b ? "game memory read directly from pages VirtualQuery confirmed readable" : "no page cache");
             applied++;
             continue;
         }

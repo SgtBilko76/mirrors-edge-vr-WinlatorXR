@@ -607,8 +607,10 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
             n, 1.0e9 / periodNs, packets, rejected, rejected ? ", first: " : "", rejected ? bad : "",
             drawn.sync, layout == 1 ? "side-by-side" : layout == 2 ? "alternate-eye" : "flat");
         const LONG reads = InterlockedExchange(&g_safeReadCalls, 0), faults = InterlockedExchange(&g_safeReadFaults, 0);
-        Log("[perf] memory reads: %ld per frame (%s), %ld faulted over 600 frames",
-            reads / 600, g_fastSafeRead ? "direct" : "ReadProcessMemory", faults);
+        const LONG queries = InterlockedExchange(&g_readCacheQueries, 0);
+        Log("[perf] memory reads: %ld per frame (%s), %ld faulted, %ld page checks over 600 frames",
+            reads / 600, g_readCache ? "page-checked direct" : g_fastSafeRead ? "direct" : "ReadProcessMemory",
+            faults, queries);
         const LONG writes = InterlockedExchange(&g_selfWriteCalls, 0), fallbacks = InterlockedExchange(&g_selfWriteFallbacks, 0);
         Log("[perf] memory writes: %ld per frame (%s), %ld needed WriteProcessMemory over 600 frames",
             writes / 600, g_fastSelfWrite ? "direct" : "WriteProcessMemory", fallbacks);
@@ -630,10 +632,17 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
         QueryPerformanceCounter(&t4);
         for (int i = 0; i < 1000; ++i) (void)NowMs();
         QueryPerformanceCounter(&t5);
+        LARGE_INTEGER t6, t7;
+        MEMORY_BASIC_INFORMATION qm;
+        for (int i = 0; i < 1000; ++i) VirtualQuery((LPCVOID)at, &qm, sizeof(qm));
+        QueryPerformanceCounter(&t6);
+        for (int i = 0; i < 1000; ++i) SafeReadCached(at, &probe, 4);
+        QueryPerformanceCounter(&t7);
         const double us = 1.0e6 / (double)qf.QuadPart / 1000.0;
         Log("[perf] per call: ReadProcessMemory %.2f us, direct read %.3f us, GetAsyncKeyState %.2f us,"
-            " WriteProcessMemory %.2f us, NowMs %.2f us",
+            " WriteProcessMemory %.2f us, NowMs %.2f us, VirtualQuery %.2f us, cached read %.3f us",
             (t1.QuadPart - t0.QuadPart) * us, (t2.QuadPart - t1.QuadPart) * us, (t3.QuadPart - t2.QuadPart) * us,
-            (t4.QuadPart - t3.QuadPart) * us, (t5.QuadPart - t4.QuadPart) * us);
+            (t4.QuadPart - t3.QuadPart) * us, (t5.QuadPart - t4.QuadPart) * us,
+            (t6.QuadPart - t5.QuadPart) * us, (t7.QuadPart - t6.QuadPart) * us);
     }
 }
