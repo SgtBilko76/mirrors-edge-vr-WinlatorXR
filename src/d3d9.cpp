@@ -217,7 +217,7 @@ static int   g_wxrPoseLag = 0;
 // WinlatorXrYawCorrection (default on): turn each alternate-eye frame by the head yaw its eye's
 // measured lag missed, so every frame shows the newest stamped pose. Computed once per frame at
 // the first eye-offset injection (render thread), applied to every view matrix of that frame.
-static bool  g_wxrYawCorrection = true;    // per-frame yaw lock, see WxrYawCorrectionForFrame
+static bool  g_wxrYawCorrection = false;   // off: turned the view away from the running direction (headset 2026-10-13); see WxrYawCorrectionForFrame
 static float g_wxrYawCorrRad = 0.0f;
 static float WxrYawCorrectionForFrame(int eye);   // winlatorxr_frame.inl
 static void  ApplyWxrYawCorrection(float* m, bool rowStorage);   // beside ApplyYawLag
