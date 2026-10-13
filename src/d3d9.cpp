@@ -210,9 +210,16 @@ static volatile LONG g_wxrDrawnLeft = 0, g_wxrDrawnRight = 0;
 // injection of the frame (render thread only; reset at Present). UE units, 65536 = 360 deg.
 static float g_wxrDrawnYaw = 0.0f;
 static bool  g_wxrDrawnYawSet = false;
-// WinlatorXrPoseLag: -1 auto (measured per eye), 0..3 = stamp the pose latched that many
-// Presents before the newest.
-static int   g_wxrPoseLag = -1;
+// WinlatorXrPoseLag: 0 (default) stamps the newest latched pose; 1..3 stamps an older one
+// (diagnostic only: an older stamp repeats the previous frame's sync, and WinlatorXR then
+// skipped those frames - the left eye froze); -1 = the measured lag per eye.
+static int   g_wxrPoseLag = 0;
+// WinlatorXrYawCorrection (default on): turn each alternate-eye frame by the head yaw its eye's
+// measured lag missed, so every frame shows the newest stamped pose. Computed once per frame at
+// the first eye-offset injection (render thread), applied to every view matrix of that frame.
+static bool  g_wxrYawCorrection = true;
+static float g_wxrYawCorrRad = 0.0f;
+static float WxrYawCorrectionForFrame(int eye);   // winlatorxr_frame.inl
 // True while the player is not in control (cinematic camera, cinematic mode, paused): the mod
 // renders the game's own mono view for the 2D screen and stands its FOV force down.
 static volatile bool g_wxrFlat = false;
@@ -21892,9 +21899,11 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                 if (g_eyeInject < 0) ++g_wxrDrawnLeft; else ++g_wxrDrawnRight;
                 if (!g_wxrDrawnYawSet) {
                     // rx, ry: the matrix's own right axis in UE world space; its heading turns
-                    // exactly with the camera's yaw.
+                    // exactly with the camera's yaw. Taken BEFORE any correction below, so the
+                    // lag measurement never sees its own output.
                     g_wxrDrawnYaw = atan2f(ry, rx) * (32768.0f / 3.14159265f);
                     g_wxrDrawnYawSet = true;
+                    g_wxrYawCorrRad = WxrYawCorrectionForFrame(g_eyeInject < 0 ? 0 : 1);
                 }
 #endif
             }
@@ -21941,6 +21950,14 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         ApplyPitchFix(m, g_vmRow);
         ApplyYawFix(m, g_vmRow);
         ApplyYawLag(m, g_vmRow);
+#if MEVR_WINLATORXR
+        if (g_wxrYawCorrection && fabsf(g_wxrYawCorrRad) > 1e-5f && (g_livePivotValid || g_camCacheValid)) {
+            const float up[3] = { 0.0f, 0.0f, 1.0f };
+            // A positive angle LOWERS the rotator's yaw (see ApplyYawLag); the correction is the
+            // yaw the camera should GAIN, so it goes in negated.
+            ApplyCameraRotation(m, g_vmRow, up, -g_wxrYawCorrRad, RotationPivot());
+        }
+#endif
         ApplySixDof(m, g_vmRow);
         ApplyRoll(m, g_vmRow);
 
@@ -28127,6 +28144,13 @@ static void LoadSettingsFile()
             g_fastSelfWrite = b;
             Log("[cfg]   WinlatorXrFastWrite = %s  (%s)", b ? "on" : "off",
                 b ? "game memory written directly, WriteProcessMemory on a fault" : "game memory written through WriteProcessMemory");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrYawCorrection") == 0) {
+            if (!SettingBool(val, &b)) { Log("[cfg]   WinlatorXrYawCorrection = %s  (not on/off - ignored)", val); rejected++; continue; }
+            g_wxrYawCorrection = b;
+            Log("[cfg]   WinlatorXrYawCorrection = %s", b ? "on (each eye turned by the head yaw its frame missed)" : "off");
             applied++;
             continue;
         }

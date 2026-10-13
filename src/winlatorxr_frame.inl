@@ -432,6 +432,29 @@ static double g_wxrLagErr[2][4][2];          // eye, lag, sign(+/-) - moving mea
 static long g_wxrLagSamples[2] = { 0, 0 };
 static int  g_wxrLagChosen[2] = { 0, 0 };
 
+static int g_wxrLagSign[2] = { 1, 1 };
+
+// Called on the render thread at the first eye-offset injection of a frame; the ring is only
+// written at Present on the same thread, so it is stable here.
+static float WxrYawCorrectionForFrame(int eye)
+{
+    if (!g_wxrYawCorrection || eye < 0 || eye > 1 || g_wxrPosePushes < 6 || g_wxrLagSamples[eye] < 40)
+        return 0.0f;
+    const int lag = g_wxrLagChosen[eye];
+    if (lag <= 0) return 0.0f;
+    const WxrPoseRec& now = g_wxrPoseRing[(g_wxrPosePushes - 1) & 7];
+    const WxrPoseRec& used = g_wxrPoseRing[(g_wxrPosePushes - 1 - lag) & 7];
+    if (!now.valid || !used.valid) return 0.0f;
+    float d = (float)(now.yaw - used.yaw);
+    while (d > 32768.0f) d -= 65536.0f;
+    while (d < -32768.0f) d += 65536.0f;
+    float rad = d * (3.14159265f / 32768.0f) * (float)g_wxrLagSign[eye];
+    const float kMax = 20.0f * (3.14159265f / 180.0f);
+    if (rad > kMax) rad = kMax;
+    if (rad < -kMax) rad = -kMax;
+    return rad;
+}
+
 static int WxrWrapYaw(float d) { while (d > 32768.0f) d -= 65536.0f; while (d < -32768.0f) d += 65536.0f; return (int)d; }
 
 static void WxrPushPose(int sync)
@@ -473,11 +496,12 @@ static int WxrStampSync(int eye, int newestSync, long frame)
                 }
             ++g_wxrLagSamples[eye];
             if (g_wxrLagSamples[eye] >= 40) {
-                double best = 1e30; int bestL = 0;
+                double best = 1e30; int bestL = 0, bestS = 0;
                 for (int L = 0; L < 4; ++L)
                     for (int s = 0; s < 2; ++s)
-                        if (g_wxrLagErr[eye][L][s] < best) { best = g_wxrLagErr[eye][L][s]; bestL = L; }
+                        if (g_wxrLagErr[eye][L][s] < best) { best = g_wxrLagErr[eye][L][s]; bestL = L; bestS = s; }
                 g_wxrLagChosen[eye] = bestL;
+                g_wxrLagSign[eye] = bestS ? -1 : 1;
             }
         }
     }
@@ -487,8 +511,10 @@ static int WxrStampSync(int eye, int newestSync, long frame)
         for (int e = 0; e < 2; ++e) {
             auto m = [&](int L) { return (std::min)(g_wxrLagErr[e][L][0], g_wxrLagErr[e][L][1]); };
             Log("[wxr] pose lag %s eye: error lag0 %.0f lag1 %.0f lag2 %.0f lag3 %.0f UU over %ld turning frames"
-                " -> stamping lag %d%s", e ? "RIGHT" : "LEFT", m(0), m(1), m(2), m(3), g_wxrLagSamples[e],
-                g_wxrPoseLag >= 0 ? g_wxrPoseLag : g_wxrLagChosen[e], g_wxrPoseLag >= 0 ? " (forced)" : "");
+                " -> drawn %d frame(s) late, %s; stamp lag %d", e ? "RIGHT" : "LEFT", m(0), m(1), m(2), m(3),
+                g_wxrLagSamples[e], g_wxrLagChosen[e],
+                g_wxrYawCorrection ? (g_wxrLagChosen[e] > 0 ? "yaw corrected" : "no correction needed") : "correction off",
+                g_wxrPoseLag >= 0 ? g_wxrPoseLag : g_wxrLagChosen[e]);
         }
     }
     const int lag = g_wxrPoseLag >= 0 ? g_wxrPoseLag : g_wxrLagChosen[eye];
@@ -606,6 +632,7 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
     const int stampEye = roomScreen ? flatEye : drawnEye;
     const int stampSync = layout == 2 ? WxrStampSync(drawnEye, drawn.sync, n) : drawn.sync;
     if (layout != 2) g_wxrDrawnYawSet = false;
+    g_wxrYawCorrRad = 0.0f;                  // the next frame's first injection sets its own
     WxrDrawMenu(dev, bb, d, roomScreen ? 2 : layout, stampEye, wxr::SafeIpd(drawn), tanX, tanY);
 
     // ---- 3. the stamp, last, so nothing drawn above can cover it ----
