@@ -445,14 +445,17 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
     int drawnEye = g_renderedEye;
     if (drawnL || drawnR) drawnEye = drawnL >= drawnR ? 0 : 1;
     {
-        static long mismatched = 0, mixed = 0, counted = 0;
+        static long mismatched = 0, mixed = 0, counted = 0, uncounted = 0;
         if (drawnL || drawnR) {
             ++counted;
             if (drawnL && drawnR) ++mixed;
             if (g_renderedEye >= 0 && drawnEye != g_renderedEye) ++mismatched;
             if ((counted % 1200) == 0)
                 Log("[wxr] alternate-eye: %ld of %ld frames were drawn for the other eye than predicted,"
-                    " %ld mixed both", mismatched, counted, mixed);
+                    " %ld mixed both; %ld stereo frames had no counted draw and used the prediction",
+                    mismatched, counted, mixed, uncounted);
+        } else if (g_stereoMode == 1 && !g_simulStereo && g_renderedEye >= 0) {
+            ++uncounted;
         }
     }
     static int monoRun = 0;
@@ -592,9 +595,14 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
 
     // The eye the next frame renders, exactly as the desktop loop chooses it.
     if (g_stereoMode == 1 && !g_simulStereo) {
-        g_renderedEye = g_nextEye;
         g_nextEye = 1 - g_nextEye;
         g_eyeInject = (g_nextEye == 0) ? -1.0f : +1.0f;
+        // The eye injected now is the eye of the frame the render thread draws next: the
+        // per-draw counter in the constant hook measured 100% agreement with THIS, and 100%
+        // disagreement with the desktop's "previous g_nextEye". The old value was only the
+        // fallback for frames with no counted world draw (~15% in game), and sent each of
+        // them to the wrong eye - the one-eye ghosting reported on 2026-10-13.
+        g_renderedEye = g_nextEye;
     } else {
         g_renderedEye = -1;
         g_eyeInject = 0.0f;

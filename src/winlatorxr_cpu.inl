@@ -85,9 +85,14 @@ static void WxrCpuTick(long frame)
         fastMask = WxrFastCoreMask(clocks, sizeof(clocks));
         Log("[cpu] core clocks (cpu:MHz) %s -> fast-core mask 0x%lX%s", clocks[0] ? clocks : "unreadable",
             (unsigned long)fastMask, g_wxrCpuPin ? "" : "  (WinlatorXrCpuPin = off: not pinning)");
-        if (g_wxrCpuPin && fastMask) {
-            WxrPinThread(GetCurrentThreadId(), fastMask, "render (Present)");
-            pinned.push_back(GetCurrentThreadId());
+    }
+    // The engine recreates its rendering thread when a level loads (headset: Present moved from
+    // thread 352 to 460), so the Present thread is checked every frame, not once.
+    if (g_wxrCpuPin && fastMask) {
+        const DWORD me = GetCurrentThreadId();
+        if (std::find(pinned.begin(), pinned.end(), me) == pinned.end()) {
+            WxrPinThread(me, fastMask, "render (Present)");
+            pinned.push_back(me);
         }
     }
     if (!gameTid && g_wxrWindow) {
