@@ -9809,11 +9809,16 @@ static int SafeReadFilter(DWORD code)
             code == EXCEPTION_IN_PAGE_ERROR) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
 }
 
+// Called through a volatile pointer on purpose: clang knows memcpy cannot throw, and with a
+// direct call it drops the __except below entirely (verified under Wine: the fault went
+// unhandled and killed the game). An opaque indirect call keeps the SEH frame.
+static void* (__cdecl* volatile g_safeReadCopy)(void*, const void*, size_t) = memcpy;
+
 static bool SafeReadFast(uintptr_t addr, void* out, size_t n)
 {
     if (addr < 0x10000 || addr + n < addr || addr + n > 0xFFFF0000u) return false;
     __try {
-        memcpy(out, (const void*)addr, n);
+        g_safeReadCopy(out, (const void*)addr, n);
     } __except (SafeReadFilter(GetExceptionCode())) {
         g_safeReadFaults++;
         return false;
