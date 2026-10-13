@@ -28284,6 +28284,15 @@ static void LoadSettingsFile()
             applied++;
             continue;
         }
+        if (_stricmp(key, "WinlatorXrStateFilterMask") == 0) {
+            const int m = atoi(val);
+            if (m < 0 || m > 7) { Log("[cfg]   WinlatorXrStateFilterMask = %s  (0..7 - ignored)", val); rejected++; continue; }
+            g_wxrStateFilterMask = m;
+            Log("[cfg]   WinlatorXrStateFilterMask = %d  (render states %s, sampler states %s, textures %s)", m,
+                (m & 1) ? "filtered" : "passed", (m & 2) ? "filtered" : "passed", (m & 4) ? "filtered" : "passed");
+            applied++;
+            continue;
+        }
         if (_stricmp(key, "WinlatorXrStateFilter") == 0) {
             if (!SettingBool(val, &b)) { Log("[cfg]   WinlatorXrStateFilter = %s  (not on/off - ignored)", val); rejected++; continue; }
             g_wxrStateFilter = b;

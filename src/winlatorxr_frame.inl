@@ -559,6 +559,7 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
             (unsigned long)g_wxrSyncWaitMs);
     }
     WxrKeepWindowPinned(dev, n);
+    WxrStateOwnerTick();
     WxrCpuTick(n);
     WxrUpdateFlatMode(n);
 

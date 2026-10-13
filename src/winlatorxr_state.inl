@@ -16,6 +16,16 @@
 // state block is created. WinlatorXrStateFilter = off removes the filter entirely.
 
 static bool g_wxrStateFilter = true;
+// WinlatorXrStateFilterMask: 1 render states, 2 sampler states, 4 textures (default 7). Lets the
+// three parts be tested one at a time on the headset.
+static int  g_wxrStateFilterMask = 7;
+// The cache is only valid for one thread's view of the device. Headset 2026-10-13: with the
+// filter on, the game froze while loading the main menu (fine on desktop); the suspected cause
+// is device calls from a second thread (loading movie). Only the thread that presents is
+// filtered; any other thread's calls pass through untouched and wipe the cache, and are logged.
+static volatile DWORD g_wxrSCThread = 0;
+static volatile LONG  g_wxrSCForeign = 0;
+static volatile DWORD g_wxrSCForeignTid = 0;
 
 struct WxrStateCache {
     DWORD rs[256];        bool rsKnown[256];
@@ -34,6 +44,16 @@ static void WxrStateInvalidate()
     memset(g_wxrSC.sampKnown, 0, sizeof(g_wxrSC.sampKnown));
     memset(g_wxrSC.texKnown, 0, sizeof(g_wxrSC.texKnown));
     g_wxrSC.vsKnown = g_wxrSC.psKnown = false;
+}
+
+// True when this call may use the cache. A call from any other thread invalidates it.
+static inline bool WxrSCMine()
+{
+    const DWORD me = GetCurrentThreadId();
+    if (me == g_wxrSCThread) return true;
+    if (g_wxrSCThread) { InterlockedIncrement(&g_wxrSCForeign); g_wxrSCForeignTid = me; }
+    WxrStateInvalidate();
+    return false;
 }
 
 static inline int WxrSamplerIndex(DWORD stage)
@@ -66,7 +86,7 @@ static PFN_SC_SBApply g_scSBApply = nullptr;
 
 static HRESULT STDMETHODCALLTYPE WxrSC_SetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE s, DWORD v)
 {
-    if (!g_wxrSC.recording && (unsigned)s < 256) {
+    if ((g_wxrStateFilterMask & 1) && WxrSCMine() && !g_wxrSC.recording && (unsigned)s < 256) {
         if (g_wxrSC.rsKnown[s] && g_wxrSC.rs[s] == v) { ++g_wxrSC.skipped[0]; return D3D_OK; }
         const HRESULT hr = g_scSetRS(d, s, v);
         if (SUCCEEDED(hr)) { g_wxrSC.rs[s] = v; g_wxrSC.rsKnown[s] = true; }
@@ -78,7 +98,7 @@ static HRESULT STDMETHODCALLTYPE WxrSC_SetRS(IDirect3DDevice9* d, D3DRENDERSTATE
 static HRESULT STDMETHODCALLTYPE WxrSC_SetSamp(IDirect3DDevice9* d, DWORD stage, D3DSAMPLERSTATETYPE t, DWORD v)
 {
     const int i = WxrSamplerIndex(stage);
-    if (!g_wxrSC.recording && i >= 0 && (unsigned)t < 16) {
+    if ((g_wxrStateFilterMask & 2) && WxrSCMine() && !g_wxrSC.recording && i >= 0 && (unsigned)t < 16) {
         if (g_wxrSC.sampKnown[i][t] && g_wxrSC.samp[i][t] == v) { ++g_wxrSC.skipped[1]; return D3D_OK; }
         const HRESULT hr = g_scSetSamp(d, stage, t, v);
         if (SUCCEEDED(hr)) { g_wxrSC.samp[i][t] = v; g_wxrSC.sampKnown[i][t] = true; }
@@ -92,7 +112,7 @@ static HRESULT STDMETHODCALLTYPE WxrSC_SetTex(IDirect3DDevice9* d, DWORD stage, 
     const int i = WxrSamplerIndex(stage);
     // Skipping a re-bind of the same texture is safe: the device already holds a reference to
     // the bound texture, so it cannot have been freed and its address reused meanwhile.
-    if (!g_wxrSC.recording && i >= 0) {
+    if ((g_wxrStateFilterMask & 4) && WxrSCMine() && !g_wxrSC.recording && i >= 0) {
         if (g_wxrSC.texKnown[i] && g_wxrSC.tex[i] == t) { ++g_wxrSC.skipped[2]; return D3D_OK; }
         const HRESULT hr = g_scSetTex(d, stage, t);
         if (SUCCEEDED(hr)) { g_wxrSC.tex[i] = t; g_wxrSC.texKnown[i] = true; } else g_wxrSC.texKnown[i] = false;
@@ -105,13 +125,13 @@ static HRESULT STDMETHODCALLTYPE WxrSC_SetTex(IDirect3DDevice9* d, DWORD stage, 
 static HRESULT STDMETHODCALLTYPE WxrSC_SetVS(IDirect3DDevice9* d, IDirect3DVertexShader9* s)
 {
     const HRESULT hr = g_scSetVS(d, s);
-    if (!g_wxrSC.recording && SUCCEEDED(hr)) { g_wxrSC.vs = s; g_wxrSC.vsKnown = true; } else g_wxrSC.vsKnown = false;
+    if (WxrSCMine() && !g_wxrSC.recording && SUCCEEDED(hr)) { g_wxrSC.vs = s; g_wxrSC.vsKnown = true; } else g_wxrSC.vsKnown = false;
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE WxrSC_SetPS(IDirect3DDevice9* d, IDirect3DPixelShader9* s)
 {
     const HRESULT hr = g_scSetPS(d, s);
-    if (!g_wxrSC.recording && SUCCEEDED(hr)) { g_wxrSC.ps = s; g_wxrSC.psKnown = true; } else g_wxrSC.psKnown = false;
+    if (WxrSCMine() && !g_wxrSC.recording && SUCCEEDED(hr)) { g_wxrSC.ps = s; g_wxrSC.psKnown = true; } else g_wxrSC.psKnown = false;
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE WxrSC_SBApply(IDirect3DStateBlock9* sb)
@@ -156,20 +176,22 @@ static HRESULT STDMETHODCALLTYPE WxrSC_EndSB(IDirect3DDevice9* d, IDirect3DState
 // The bound shaders without asking DXVK when the tracker knows them; no reference is added.
 static IDirect3DVertexShader9* WxrCurrentVS(IDirect3DDevice9* dev)
 {
-    if (g_wxrStateFilter && g_scSetVS && g_wxrSC.vsKnown) return g_wxrSC.vs;
+    const bool mine = GetCurrentThreadId() == g_wxrSCThread;
+    if (g_wxrStateFilter && g_scSetVS && mine && g_wxrSC.vsKnown) return g_wxrSC.vs;
     IDirect3DVertexShader9* s = nullptr;
     if (FAILED(dev->GetVertexShader(&s)) || !s) return nullptr;
     s->Release();                       // the device keeps its own reference while bound
-    if (g_wxrStateFilter && g_scSetVS && !g_wxrSC.recording) { g_wxrSC.vs = s; g_wxrSC.vsKnown = true; }
+    if (g_wxrStateFilter && g_scSetVS && mine && !g_wxrSC.recording) { g_wxrSC.vs = s; g_wxrSC.vsKnown = true; }
     return s;
 }
 static IDirect3DPixelShader9* WxrCurrentPS(IDirect3DDevice9* dev)
 {
-    if (g_wxrStateFilter && g_scSetPS && g_wxrSC.psKnown) return g_wxrSC.ps;
+    const bool mine = GetCurrentThreadId() == g_wxrSCThread;
+    if (g_wxrStateFilter && g_scSetPS && mine && g_wxrSC.psKnown) return g_wxrSC.ps;
     IDirect3DPixelShader9* s = nullptr;
     if (FAILED(dev->GetPixelShader(&s)) || !s) return nullptr;
     s->Release();
-    if (g_wxrStateFilter && g_scSetPS && !g_wxrSC.recording) { g_wxrSC.ps = s; g_wxrSC.psKnown = true; }
+    if (g_wxrStateFilter && g_scSetPS && mine && !g_wxrSC.recording) { g_wxrSC.ps = s; g_wxrSC.psKnown = true; }
     return s;
 }
 
@@ -190,6 +212,18 @@ static void WxrInstallStateFilter(IDirect3DDevice9* dev)
     Log("[state] redundant-state filter installed (render, sampler, texture; shader tracking)");
 }
 
+// Called from Present: the presenting thread owns the cache. When it changes (the engine
+// recreates its rendering thread on a level load) the cache starts over.
+static void WxrStateOwnerTick()
+{
+    const DWORD me = GetCurrentThreadId();
+    if (me != g_wxrSCThread) {
+        Log("[state] filter now follows the presenting thread %lu (was %lu)", (unsigned long)me, (unsigned long)g_wxrSCThread);
+        g_wxrSCThread = me;
+        WxrStateInvalidate();
+    }
+}
+
 static void WxrStateReport(long frames)
 {
     if (!g_wxrStateFilter || frames <= 0) return;
@@ -202,4 +236,7 @@ static void WxrStateReport(long frames)
         g_wxrSC.skipped[i] = g_wxrSC.passed[i] = 0;
     }
     Log("[state] redundant calls kept from DXVK: %s", line);
+    const LONG foreign = InterlockedExchange(&g_wxrSCForeign, 0);
+    if (foreign) Log("[state] %ld state calls came from another thread (last %lu) - passed through, cache reset",
+                     foreign, (unsigned long)g_wxrSCForeignTid);
 }
