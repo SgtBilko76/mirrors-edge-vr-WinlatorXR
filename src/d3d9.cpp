@@ -206,6 +206,13 @@ static bool g_wxrRoomScreen = false;          // WinlatorXrMenuScreen = flat (de
 static void WxrInstallInputBlock();
 // Counted on the render thread while scene constants get their eye offset; read at Present.
 static volatile LONG g_wxrDrawnLeft = 0, g_wxrDrawnRight = 0;
+// The camera yaw the render thread really drew this frame with, taken from the first eye-offset
+// injection of the frame (render thread only; reset at Present). UE units, 65536 = 360 deg.
+static float g_wxrDrawnYaw = 0.0f;
+static bool  g_wxrDrawnYawSet = false;
+// WinlatorXrPoseLag: -1 auto (measured per eye), 0..3 = stamp the pose latched that many
+// Presents before the newest.
+static int   g_wxrPoseLag = -1;
 // True while the player is not in control (cinematic camera, cinematic mode, paused): the mod
 // renders the game's own mono view for the 2D screen and stands its FOV force down.
 static volatile bool g_wxrFlat = false;
@@ -21883,6 +21890,12 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                 // prediction at Present assumed a fixed one-frame render lag that Box64 does not
                 // keep, and the left eye flickered whenever a frame reached the wrong one.
                 if (g_eyeInject < 0) ++g_wxrDrawnLeft; else ++g_wxrDrawnRight;
+                if (!g_wxrDrawnYawSet) {
+                    // rx, ry: the matrix's own right axis in UE world space; its heading turns
+                    // exactly with the camera's yaw.
+                    g_wxrDrawnYaw = atan2f(ry, rx) * (32768.0f / 3.14159265f);
+                    g_wxrDrawnYawSet = true;
+                }
 #endif
             }
         }
@@ -28114,6 +28127,14 @@ static void LoadSettingsFile()
             g_fastSelfWrite = b;
             Log("[cfg]   WinlatorXrFastWrite = %s  (%s)", b ? "on" : "off",
                 b ? "game memory written directly, WriteProcessMemory on a fault" : "game memory written through WriteProcessMemory");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrPoseLag") == 0) {
+            if (_stricmp(val, "auto") == 0) g_wxrPoseLag = -1;
+            else if (val[0] >= '0' && val[0] <= '3' && !val[1]) g_wxrPoseLag = val[0] - '0';
+            else { Log("[cfg]   WinlatorXrPoseLag = %s  (auto or 0..3 - ignored)", val); rejected++; continue; }
+            Log("[cfg]   WinlatorXrPoseLag = %s", g_wxrPoseLag < 0 ? "auto (measured per eye)" : val);
             applied++;
             continue;
         }

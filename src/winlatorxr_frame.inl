@@ -414,6 +414,88 @@ static void WxrUpdateFlatMode(long frame)
 
 #include "winlatorxr_cpu.inl"
 
+// ---- which head pose a frame was really drawn with ----
+//
+// Head yaw reaches the picture indirectly: the mod writes it into the player controller at
+// Present, the game thread builds its camera from it, and the render thread draws that camera
+// one or more Presents later - a lag Box64 does not keep constant. The red sync stamp must name
+// the pose the picture was drawn with, or WinlatorXR reprojects by the wrong amount and the
+// picture doubles while the head turns (reported 2026-10-13: left eye only, on head turns).
+// Each Present records the sync it latched and the controller yaw it left; each alternate-eye
+// frame's drawn camera yaw (from the view matrix, see the constant hook) is matched against
+// them by yaw CHANGE (offsets between controller and camera cancel), per eye, and the stamp
+// uses the best-matching lag. WinlatorXrPoseLag = 0..3 forces a lag instead.
+struct WxrPoseRec { int sync; int32_t yaw; bool valid; };
+static WxrPoseRec g_wxrPoseRing[8];
+static long g_wxrPosePushes = 0;
+static double g_wxrLagErr[2][4][2];          // eye, lag, sign(+/-) - moving mean |dCam - s*dCtl|
+static long g_wxrLagSamples[2] = { 0, 0 };
+static int  g_wxrLagChosen[2] = { 0, 0 };
+
+static int WxrWrapYaw(float d) { while (d > 32768.0f) d -= 65536.0f; while (d < -32768.0f) d += 65536.0f; return (int)d; }
+
+static void WxrPushPose(int sync)
+{
+    WxrPoseRec r{ sync, 0, false };
+    int32_t rot[3];
+    if (g_lastPlayerController && g_offActorRotation >= 0 &&
+        SafeRead(g_lastPlayerController + g_offActorRotation, rot, sizeof(rot))) { r.yaw = rot[1]; r.valid = true; }
+    g_wxrPoseRing[g_wxrPosePushes & 7] = r;
+    ++g_wxrPosePushes;
+}
+
+// Returns the sync to stamp on an alternate-eye frame of `eye`, updating the measurement.
+static int WxrStampSync(int eye, int newestSync, long frame)
+{
+    static float prevCam = 0.0f;
+    static long prevPushes = -10;
+    const bool haveCam = g_wxrDrawnYawSet;
+    const float cam = g_wxrDrawnYaw;
+    g_wxrDrawnYawSet = false;
+    if (eye < 0 || eye > 1 || g_wxrPosePushes < 6) return newestSync;
+
+    auto rec = [](int lag) -> const WxrPoseRec& { return g_wxrPoseRing[(g_wxrPosePushes - 1 - lag) & 7]; };
+    if (haveCam && prevPushes == g_wxrPosePushes - 1) {
+        const int dCam = WxrWrapYaw(cam - prevCam);
+        float dCtl[4]; bool ok = true;
+        for (int L = 0; L < 4; ++L) {
+            const WxrPoseRec& a = rec(L); const WxrPoseRec& b = rec(L + 1);
+            if (!a.valid || !b.valid) { ok = false; break; }
+            dCtl[L] = (float)WxrWrapYaw((float)(a.yaw - b.yaw));
+        }
+        // Only while turning: at rest every lag matches.
+        if (ok && (abs(dCam) > 40 || fabsf(dCtl[0]) > 40 || fabsf(dCtl[1]) > 40) && abs(dCam) < 6000) {
+            for (int L = 0; L < 4; ++L)
+                for (int s = 0; s < 2; ++s) {
+                    const double e = fabs((double)dCam - (s ? -1.0 : 1.0) * dCtl[L]);
+                    double& m = g_wxrLagErr[eye][L][s];
+                    m = g_wxrLagSamples[eye] ? m * 0.97 + e * 0.03 : e;
+                }
+            ++g_wxrLagSamples[eye];
+            if (g_wxrLagSamples[eye] >= 40) {
+                double best = 1e30; int bestL = 0;
+                for (int L = 0; L < 4; ++L)
+                    for (int s = 0; s < 2; ++s)
+                        if (g_wxrLagErr[eye][L][s] < best) { best = g_wxrLagErr[eye][L][s]; bestL = L; }
+                g_wxrLagChosen[eye] = bestL;
+            }
+        }
+    }
+    prevCam = cam; prevPushes = haveCam ? g_wxrPosePushes : -10;
+
+    if ((frame % 600) == 0) {
+        for (int e = 0; e < 2; ++e) {
+            auto m = [&](int L) { return (std::min)(g_wxrLagErr[e][L][0], g_wxrLagErr[e][L][1]); };
+            Log("[wxr] pose lag %s eye: error lag0 %.0f lag1 %.0f lag2 %.0f lag3 %.0f UU over %ld turning frames"
+                " -> stamping lag %d%s", e ? "RIGHT" : "LEFT", m(0), m(1), m(2), m(3), g_wxrLagSamples[e],
+                g_wxrPoseLag >= 0 ? g_wxrPoseLag : g_wxrLagChosen[e], g_wxrPoseLag >= 0 ? " (forced)" : "");
+        }
+    }
+    const int lag = g_wxrPoseLag >= 0 ? g_wxrPoseLag : g_wxrLagChosen[eye];
+    const WxrPoseRec& r = rec(lag);
+    return lag == 0 ? newestSync : r.sync;
+}
+
 static void WxrSubmitFrame(IDirect3DDevice9* dev)
 {
     if (!g_xrRunning) return;
@@ -522,12 +604,14 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
         }
     }
     const int stampEye = roomScreen ? flatEye : drawnEye;
+    const int stampSync = layout == 2 ? WxrStampSync(drawnEye, drawn.sync, n) : drawn.sync;
+    if (layout != 2) g_wxrDrawnYawSet = false;
     WxrDrawMenu(dev, bb, d, roomScreen ? 2 : layout, stampEye, wxr::SafeIpd(drawn), tanX, tanY);
 
     // ---- 3. the stamp, last, so nothing drawn above can cover it ----
     // A 10x10 block rather than one pixel survives any scaling between backbuffer and X screen.
     const RECT syncRect = { 0, 0, 10, 10 };
-    const HRESULT shr = dev->ColorFill(bb, &syncRect, D3DCOLOR_XRGB(drawn.sync & 0xFF, 0,
+    const HRESULT shr = dev->ColorFill(bb, &syncRect, D3DCOLOR_XRGB(stampSync & 0xFF, 0,
                                        ((layout == 2 || roomScreen) && stampEye == 1) ? 255 : 0));
     // An odd interval, so alternate-eye dumps land on both eyes.
     if ((n % 29) == 0) WxrServeFrameDump(dev, bb, d);
@@ -583,6 +667,7 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
     if (g_stereoMode == 1) AdoptLocatedViews(now);
 
     ApplyHeadTracking(now);
+    WxrPushPose(wxr::Frame().sync);          // the pose just latched and the yaw it left behind
     const bool actionsSynced = XrSyncInput(now);
     XrSampleMotionPoses(now, actionsSynced);
     PublishP13PoseSnapshot();
