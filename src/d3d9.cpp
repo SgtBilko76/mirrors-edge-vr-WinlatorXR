@@ -9791,8 +9791,40 @@ static int       g_offName = -1;
 static bool      g_objModelDone = false;
 static volatile LONG g_objModelThreadFinished = 0;
 
+// WinlatorXR: own-process ReadProcessMemory is a full NtReadVirtualMemory round trip through
+// Wine and Box64 on the headset, and the arm update alone makes thousands of these reads a frame
+// (measured 25 ms of the game thread on the Quest against 0.5 ms under desktop Wine). The fast
+// path copies directly and catches a bad address with SEH instead. WinlatorXrFastRead = off
+// restores the ReadProcessMemory path.
+#if MEVR_WINLATORXR
+static bool g_fastSafeRead = true;
+#else
+static const bool g_fastSafeRead = false;
+#endif
+static volatile LONG g_safeReadCalls = 0, g_safeReadFaults = 0;
+
+static int SafeReadFilter(DWORD code)
+{
+    return (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_GUARD_PAGE ||
+            code == EXCEPTION_IN_PAGE_ERROR) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+static bool SafeReadFast(uintptr_t addr, void* out, size_t n)
+{
+    if (addr < 0x10000 || addr + n < addr || addr + n > 0xFFFF0000u) return false;
+    __try {
+        memcpy(out, (const void*)addr, n);
+    } __except (SafeReadFilter(GetExceptionCode())) {
+        g_safeReadFaults++;
+        return false;
+    }
+    return true;
+}
+
 static bool SafeRead(uintptr_t addr, void* out, size_t n)
 {
+    g_safeReadCalls++;
+    if (g_fastSafeRead) return SafeReadFast(addr, out, n);
     SIZE_T got = 0;
     return ReadProcessMemory(GetCurrentProcess(), (LPCVOID)addr, out, n, &got) && got == n;
 }
@@ -27926,6 +27958,14 @@ static void LoadSettingsFile()
             else if (_stricmp(val, "game") == 0) g_wxrGraphicsProfile = false;
             else { Log("[cfg]   WinlatorXrGraphics = %s  (quest or game - ignored)", val); rejected++; continue; }
             Log("[cfg]   WinlatorXrGraphics = %s", g_wxrGraphicsProfile ? "quest" : "game");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrFastRead") == 0) {
+            if (!SettingBool(val, &b)) { Log("[cfg]   WinlatorXrFastRead = %s  (not on/off - ignored)", val); rejected++; continue; }
+            g_fastSafeRead = b;
+            Log("[cfg]   WinlatorXrFastRead = %s  (%s)", b ? "on" : "off",
+                b ? "game memory read directly, SEH-guarded" : "game memory read through ReadProcessMemory");
             applied++;
             continue;
         }

@@ -606,5 +606,23 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
         Log("[wxr] frame %ld: %.1f fps, %ld packets (%ld rejected%s%s), sync %d, %s",
             n, 1.0e9 / periodNs, packets, rejected, rejected ? ", first: " : "", rejected ? bad : "",
             drawn.sync, layout == 1 ? "side-by-side" : layout == 2 ? "alternate-eye" : "flat");
+        const LONG reads = InterlockedExchange(&g_safeReadCalls, 0), faults = InterlockedExchange(&g_safeReadFaults, 0);
+        Log("[perf] memory reads: %ld per frame (%s), %ld faulted over 600 frames",
+            reads / 600, g_fastSafeRead ? "direct" : "ReadProcessMemory", faults);
+        // What each call costs on this machine, 1000 of each, on the render thread.
+        LARGE_INTEGER qf, t0, t1, t2, t3;
+        QueryPerformanceFrequency(&qf);
+        uint32_t probe = 0;
+        const uintptr_t at = (uintptr_t)&g_xrFrames;
+        QueryPerformanceCounter(&t0);
+        for (int i = 0; i < 1000; ++i) { SIZE_T got; ReadProcessMemory(GetCurrentProcess(), (LPCVOID)at, &probe, 4, &got); }
+        QueryPerformanceCounter(&t1);
+        for (int i = 0; i < 1000; ++i) SafeReadFast(at, &probe, 4);
+        QueryPerformanceCounter(&t2);
+        for (int i = 0; i < 1000; ++i) GetAsyncKeyState(VK_F1 + (i & 7));
+        QueryPerformanceCounter(&t3);
+        const double us = 1.0e6 / (double)qf.QuadPart / 1000.0;
+        Log("[perf] per call: ReadProcessMemory %.2f us, direct read %.3f us, GetAsyncKeyState %.2f us",
+            (t1.QuadPart - t0.QuadPart) * us, (t2.QuadPart - t1.QuadPart) * us, (t3.QuadPart - t2.QuadPart) * us);
     }
 }
