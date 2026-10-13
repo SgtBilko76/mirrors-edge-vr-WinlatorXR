@@ -652,44 +652,18 @@ static bool SyncEngineResolution(UINT w, UINT h, char* whatHappened, size_t what
 // game's look is built on it. Only keys already in [SystemSettings] are rewritten, and the rest
 // of the file - other sections, comments, line endings - is copied through untouched.
 // WinlatorXrGraphics = game leaves the player's own settings alone.
-// 0 = game (untouched), 1 = quest, 2 = low (default since 2026-10-13: the headset log showed the
-// render thread at ~90% of a core, so draw calls, not pixels, are the limit; the GPU sat at ~45%).
-static int g_wxrGraphicsProfile = 2;
+static bool g_wxrGraphicsProfile = true;
 static void WxrApplyQuestGraphics()
 {
     if (!g_wxrGraphicsProfile) { Log("[wxr] graphics: the game's own settings (WinlatorXrGraphics = game)"); return; }
-    static const char* const kQuest[][2] = {
+    static const char* const kKeys[][2] = {
         { "DynamicShadows", "False" }, { "LightEnvironmentShadows", "False" },
         { "MotionBlur", "False" }, { "DepthOfField", "False" }, { "AmbientOcclusion", "False" },
         { "Distortion", "False" }, { "LensFlares", "False" },
         { "DetailMode", "1" }, { "MaxShadowResolution", "256" }, { "MaxAnisotropy", "2" },
         { "SkeletalMeshLODBias", "1" }, { "ParticleLODBias", "1" }, { "UseVsync", "False" },
-        { "OneFrameThreadLag", "True" },
     };
-    // On top of quest: every one of these removes whole draw passes or objects on the render
-    // thread. Static decals (signs, graffiti) and bloom stay - they carry the game's look.
-    static const char* const kLow[][2] = {
-        { "DetailMode", "0" },                     // drops detail-only meshes and effects
-        { "DynamicLights", "False" },              // no extra lighting pass per dynamic light
-        { "CompositeDynamicLights", "True" },      // fold the rest into the light environment
-        { "DynamicDecals", "False" },              // bullet holes, footprints
-        { "FogVolumes", "False" },
-        { "DirectionalLightmaps", "False" },       // simpler lightmap shaders
-        { "QualityBloom", "False" },               // cheaper bloom, bloom itself kept
-        { "ParticleLODBias", "2" },
-        { "FoliageDrawRadiusMultiplier", "0.5" },
-        { "MaxShadowResolution", "128" },
-    };
-    const char* kKeys[64][2];
-    int kCount = 0;
-    for (const auto& k : kQuest) { kKeys[kCount][0] = k[0]; kKeys[kCount][1] = k[1]; ++kCount; }
-    if (g_wxrGraphicsProfile >= 2)
-        for (const auto& k : kLow) {
-            int at = 0;
-            while (at < kCount && strcmp(kKeys[at][0], k[0]) != 0) ++at;
-            kKeys[at][0] = k[0]; kKeys[at][1] = k[1];
-            if (at == kCount) ++kCount;
-        }
+    const int kCount = (int)(sizeof(kKeys) / sizeof(kKeys[0]));
     wchar_t path[MAX_PATH];
     if (!FindTdEngineIni(path, MAX_PATH)) { Log("[wxr] graphics: TdEngine.ini not found yet - applied from the next launch"); return; }
     HANDLE h1 = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -733,17 +707,14 @@ static void WxrApplyQuestGraphics()
         if (e < text.size()) out += '\n';
         i = e + 1;
     }
-    if (!changed) { Log("[wxr] graphics: %s profile already set (%d of %d keys present)",
-                        g_wxrGraphicsProfile >= 2 ? "low" : "Quest", found, kCount); return; }
+    if (!changed) { Log("[wxr] graphics: Quest profile already set (%d of %d keys present)", found, kCount); return; }
     HANDLE h2 = CreateFileW(path, GENERIC_WRITE, 0, nullptr, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h2 == INVALID_HANDLE_VALUE) { Log("[wxr] graphics: TdEngine.ini not writable"); return; }
     DWORD written = 0;
     const bool ok = WriteFile(h2, out.data(), (DWORD)out.size(), &written, nullptr) && written == out.size();
     CloseHandle(h2);
-    Log("*** [wxr] graphics: %s profile %s - %d of %d keys changed (shadows, DOF, motion blur,"
-        " distortion, AO, lens flares off; %s; bloom kept)", g_wxrGraphicsProfile >= 2 ? "low" : "Quest",
-        ok ? "written" : "write FAILED", changed, kCount,
-        g_wxrGraphicsProfile >= 2 ? "detail low, no dynamic lights/decals/fog volumes" : "detail medium");
+    Log("*** [wxr] graphics: Quest profile %s - %d of %d keys changed (shadows, DOF, motion blur,"
+        " distortion, AO, lens flares off; detail medium; bloom kept)", ok ? "written" : "write FAILED", changed, kCount);
 }
 #endif
 
@@ -28123,11 +28094,10 @@ static void LoadSettingsFile()
         bool b = false;
 #if MEVR_WINLATORXR
         if (_stricmp(key, "WinlatorXrGraphics") == 0) {
-            if (_stricmp(val, "low") == 0) g_wxrGraphicsProfile = 2;
-            else if (_stricmp(val, "quest") == 0) g_wxrGraphicsProfile = 1;
-            else if (_stricmp(val, "game") == 0) g_wxrGraphicsProfile = 0;
-            else { Log("[cfg]   WinlatorXrGraphics = %s  (low, quest or game - ignored)", val); rejected++; continue; }
-            Log("[cfg]   WinlatorXrGraphics = %s", g_wxrGraphicsProfile >= 2 ? "low" : g_wxrGraphicsProfile ? "quest" : "game");
+            if (_stricmp(val, "quest") == 0) g_wxrGraphicsProfile = true;
+            else if (_stricmp(val, "game") == 0) g_wxrGraphicsProfile = false;
+            else { Log("[cfg]   WinlatorXrGraphics = %s  (quest or game - ignored)", val); rejected++; continue; }
+            Log("[cfg]   WinlatorXrGraphics = %s", g_wxrGraphicsProfile ? "quest" : "game");
             applied++;
             continue;
         }
