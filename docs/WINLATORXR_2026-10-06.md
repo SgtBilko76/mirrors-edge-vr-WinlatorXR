@@ -216,3 +216,13 @@ not run here.
 - Frame rate on Box64 with draw duplication; alternate-eye (F10 path) as a fallback.
 - `README.md` and `packaging/README.txt` describe only the desktop release; update them once
   the Quest flavour is verified and has a release shape.
+
+## Menus on WinlatorXR's flat 2D screen (2026-10-13)
+
+The curved room-fixed screen looked bad for menus in the headset. Default is now
+`WinlatorXrMenuScreen = flat`: while the player is not in control (menus, loading, videos,
+cutscenes, pause) the game's own frame goes untouched to WinlatorXR's 2D screen
+(`MODE_VR 2`, `MODE_3D 0`, FOV `0 0`). When the window's aspect differs from the frame (1792x1008
+frame in a 1792x1624 container), Present gets a centred destination rect, so the frame is shown
+1:1 with black bars instead of stretched. Stereo starts when the player is in control, as before.
+`WinlatorXrMenuScreen = room` brings back the curved screen. Headset check pending.

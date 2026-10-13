@@ -489,8 +489,32 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
     // detail of a side-by-side half, and a still picture loses nothing at half the refresh.
     static int flatEye = 0;
     bool roomScreen = false;
-    if (layout == 0) { flatEye ^= 1; roomScreen = WxrDrawVirtualScreen(dev, bb, d, drawn, tanX, tanY, flatEye); }
+    // Default (WinlatorXrMenuScreen = flat): the game's own frame goes untouched to WinlatorXR's
+    // 2D screen (MODE_VR 2, FOV 0 0) - the full window resolution, the sharpest way to show text.
+    if (layout == 0 && g_wxrRoomScreen) { flatEye ^= 1; roomScreen = WxrDrawVirtualScreen(dev, bb, d, drawn, tanX, tanY, flatEye); }
     else g_wxrAnchor.valid = false;          // the next screen anchors where the player looks then
+    // On WinlatorXR's 2D screen the whole X screen is shown. The 16:9 menu frame stretched over a
+    // taller window would look squashed, so it is presented 1:1 (or fitted), centred, black bars.
+    g_wxrPresentDstValid = false;
+    if (layout == 0 && !roomScreen && g_wxrWindow) {
+        RECT cr{};
+        if (GetClientRect(g_wxrWindow, &cr) && cr.right > 0 && cr.bottom > 0) {
+            const float cw = (float)cr.right, ch = (float)cr.bottom;
+            if (fabsf(cw / ch - (float)d.Width / d.Height) > 0.01f * cw / ch) {
+                const float s = (std::min)(cw / d.Width, ch / d.Height);
+                const LONG w = (LONG)(d.Width * s + 0.5f), h = (LONG)(d.Height * s + 0.5f);
+                g_wxrPresentDst.left = (cr.right - w) / 2; g_wxrPresentDst.top = (cr.bottom - h) / 2;
+                g_wxrPresentDst.right = g_wxrPresentDst.left + w; g_wxrPresentDst.bottom = g_wxrPresentDst.top + h;
+                g_wxrPresentDstValid = true;
+                static LONG loggedW = 0, loggedH = 0;
+                if (loggedW != cr.right || loggedH != cr.bottom) {
+                    loggedW = cr.right; loggedH = cr.bottom;
+                    Log("[wxr] 2D screen: %ux%u frame shown centred at %ld,%ld %ldx%ld in the %ldx%ld window",
+                        d.Width, d.Height, g_wxrPresentDst.left, g_wxrPresentDst.top, w, h, cr.right, cr.bottom);
+                }
+            }
+        }
+    }
     const int stampEye = roomScreen ? flatEye : drawnEye;
     WxrDrawMenu(dev, bb, d, roomScreen ? 2 : layout, stampEye, wxr::SafeIpd(drawn), tanX, tanY);
 
@@ -518,7 +542,7 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
                 Log("*** [wxr] PRESENTING -> %s (change #%ld; stereoMode %d viewsValid %d dup %ld"
                     " simul %d eye %d scene %ux%u frame %ux%u, fov %.1f x %.1f, stamp %s)",
                     layout == 1 ? "side-by-side stereo" : layout == 2 ? "alternate-eye stereo"
-                                : roomScreen ? "room-fixed virtual screen" : "flat screen (head-locked)",
+                                : roomScreen ? "room-fixed virtual screen" : "WinlatorXR 2D screen",
                     changes, g_stereoMode, g_viewsValid ? 1 : 0, (long)dupThisFrame,
                     g_simulStereo ? 1 : 0, g_renderedEye, SceneW(), SceneH(), d.Width, d.Height,
                     fovX, fovY, SUCCEEDED(shr) ? "ok" : "FAILED");

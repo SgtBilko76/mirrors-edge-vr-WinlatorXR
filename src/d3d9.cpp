@@ -197,6 +197,11 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev);
 static void WxrReleaseDeviceResources();
 extern bool g_wxrAlternateEye;
 static bool g_wxrBlockKeyboardMouse = true;   // WinlatorXrKeyboardMouse = off (default): gamepad only
+// Set by WxrSubmitFrame for a 2D-screen frame whose aspect differs from the pinned window: Present
+// then shows the backbuffer 1:1 centred with black bars, instead of stretched over the window.
+static RECT g_wxrPresentDst{};
+static bool g_wxrPresentDstValid = false;
+static bool g_wxrRoomScreen = false;          // WinlatorXrMenuScreen = flat (default): WinlatorXR's own 2D screen; room = curved screen drawn by the mod
 static void WxrInstallInputBlock();
 // Counted on the render thread while scene constants get their eye offset; read at Present.
 static volatile LONG g_wxrDrawnLeft = 0, g_wxrDrawnRight = 0;
@@ -26861,6 +26866,9 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         Log("[present] frame %ld   pools so far: DEFAULT=%ld MANAGED=%ld SYSTEMMEM=%ld other=%ld",
             f, g_poolDefault, g_poolManaged, g_poolSystemMem, g_poolScratch);
     }
+#if MEVR_WINLATORXR
+    if (g_wxrPresentDstValid && !dst) return g_origPresent(dev, nullptr, &g_wxrPresentDst, wnd, dirty);
+#endif
     return g_origPresent(dev, src, dst, wnd, dirty);
 }
 
@@ -27918,6 +27926,15 @@ static void LoadSettingsFile()
             else if (_stricmp(val, "game") == 0) g_wxrGraphicsProfile = false;
             else { Log("[cfg]   WinlatorXrGraphics = %s  (quest or game - ignored)", val); rejected++; continue; }
             Log("[cfg]   WinlatorXrGraphics = %s", g_wxrGraphicsProfile ? "quest" : "game");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrMenuScreen") == 0) {
+            if (_stricmp(val, "flat") == 0) g_wxrRoomScreen = false;
+            else if (_stricmp(val, "room") == 0) g_wxrRoomScreen = true;
+            else { Log("[cfg]   WinlatorXrMenuScreen = %s  (flat or room - ignored)", val); rejected++; continue; }
+            Log("[cfg]   WinlatorXrMenuScreen = %s  (%s)", g_wxrRoomScreen ? "room" : "flat",
+                g_wxrRoomScreen ? "menus on a curved screen drawn by the mod" : "menus on WinlatorXR's flat 2D screen at full window resolution");
             applied++;
             continue;
         }
