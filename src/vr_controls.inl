@@ -26,6 +26,13 @@ static void VrSelectController(bool connected,const MEVR_XINPUT_STATE& state,boo
     previousPhysical=connected&&activity;previousQuest=questActivity;
     bool next=g_standardControllerActive;
     if(g_controllerMode==1||!connected)next=false;
+#if MEVR_WINLATORXR
+    // WinlatorXR also presents the Touch controllers as an XInput pad with its own mapping. In
+    // Auto that pad won every time it saw input: the game got WinlatorXR's buttons (A was not
+    // A) and the grips fell back to jump. On the headset Auto therefore means the Touch layout;
+    // ControllerMode = gamepad still selects a real pad explicitly.
+    else if(g_controllerMode==0)next=false;
+#endif
     else if(g_controllerMode==2)next=true;
     else if(physicalEdge)next=true;
     else if(questEdge)next=false;

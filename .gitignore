@@ -26,6 +26,8 @@ openxr_loader*.dll
 # to a tag, not in git history - a zip does not delta-compress, so every rebuild committed
 # would add its full size to the clone forever.
 dist/
+# src/build_linux.py output
+build/
 
 # ---- run artefacts ----
 last_run.log

@@ -146,8 +146,16 @@ template<class FN> static bool DrawStereoCanvas(IDirect3DDevice9* dev,FN issue,H
     // never to all Canvas text (the two panels share their text shader/atlases).
     const bool wasPopup=g_canvasPopup.active&&g_canvasPopup.frame==g_frames;
     g_canvasPopup.active=false; // any rejected/non-Canvas draw terminates the run
-    if(!g_stereoUI||!g_simulStereo||g_inDupDraw||g_sceneSplitMono||g_scenePartialMono||
-        !g_sceneMatValid||InterlockedCompareExchange(&g_dupFrameDraws,0,0)<=0)return false;
+#if MEVR_WINLATORXR
+    // Alternate-eye on the headset: each frame is one full-width eye. The UI is not duplicated,
+    // but it still needs pulling in from the edges of a 109 degree view, so it gets the same
+    // scale and height about the frame's centre in a single pass.
+    const bool singleEye=g_stereoMode==1&&!g_simulStereo;
+#else
+    const bool singleEye=false;
+#endif
+    if(!g_stereoUI||(!g_simulStereo&&!singleEye)||g_inDupDraw||g_sceneSplitMono||g_scenePartialMono||
+        !g_sceneMatValid||(!singleEye&&InterlockedCompareExchange(&g_dupFrameDraws,0,0)<=0))return false;
     const auto* shader=FindEffectShader(dev);
     if(!shader)return false;
     // The pause menu's red material panel uses the ordinary mesh vertex
@@ -207,8 +215,8 @@ template<class FN> static bool DrawStereoCanvas(IDirect3DDevice9* dev,FN issue,H
     const float uiScale=g_gameUiScale*(popupThisDraw?.9f:1.f);
     const float uiHeight=g_gameUiHeight+(popupThisDraw?.12f:0.f);
     *result=D3D_OK;g_inDupDraw=true;
-    for(int eye=0;eye<2;++eye){D3DVIEWPORT9 vp=original;
-        const DWORD eyeWidth=original.Width/2;
+    for(int eye=0;eye<(singleEye?1:2);++eye){D3DVIEWPORT9 vp=original;
+        const DWORD eyeWidth=singleEye?original.Width:original.Width/2;
         vp.Width=(DWORD)(std::max)(1.f,floorf(eyeWidth*uiScale));
         vp.Height=(DWORD)(std::max)(1.f,floorf(original.Height*uiScale));
         vp.X=original.X+eye*eyeWidth+(eyeWidth-vp.Width)/2;

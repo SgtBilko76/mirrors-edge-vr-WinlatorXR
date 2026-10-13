@@ -94,6 +94,7 @@
 // already here. Reached by relative path: the build only puts MinHook's include/ on /I.
 #include "../third_party/minhook/src/hde/hde32.h"
 
+
 // ---------------------------------------------------------------- vtable slots
 
 enum {
@@ -140,6 +141,16 @@ enum {
 // cannot say which build produced it turns every bug report into a round trip. Logged in the
 // header, above everything, so it survives truncation from either end.
 #define MEVR_VERSION "0.2.2-alpha"
+// The OpenXR frame path, which the WinlatorXR flavour replaces wholesale. Marked so the
+// unused-static check stays fatal for everything else in that flavour.
+#if MEVR_WINLATORXR
+#define MEVR_DESKTOP_ONLY [[maybe_unused]]
+#else
+#define MEVR_DESKTOP_ONLY
+#endif
+#if !MEVR_WINLATORXR
+#define MEVR_WXR_FLAT() (false)
+#endif
 #include "build_identity.inl"
 
 // ---------------------------------------------------------------- state
@@ -181,6 +192,19 @@ static bool VrMenuInputTick(XrTime when, bool focused, bool y, bool a, bool b,
                             bool other, float x, float z, bool* shortY);
 static bool VrMenuLayer(XrCompositionLayerQuad* layer);
 static void VrMenuResolveEngine();
+#if MEVR_WINLATORXR
+static void WxrSubmitFrame(IDirect3DDevice9* dev);
+static void WxrReleaseDeviceResources();
+extern bool g_wxrAlternateEye;
+static bool g_wxrBlockKeyboardMouse = true;   // WinlatorXrKeyboardMouse = off (default): gamepad only
+static void WxrInstallInputBlock();
+// Counted on the render thread while scene constants get their eye offset; read at Present.
+static volatile LONG g_wxrDrawnLeft = 0, g_wxrDrawnRight = 0;
+// True while the player is not in control (cinematic camera, cinematic mode, paused): the mod
+// renders the game's own mono view for the 2D screen and stands its FOV force down.
+static volatile bool g_wxrFlat = false;
+#define MEVR_WXR_FLAT() (g_wxrFlat)
+#endif
 static void PkPipeResolveMetadata();
 static void VrControlsResolveMetadata();
 static void VrControlsTick();
@@ -262,6 +286,18 @@ static long                 g_xrFrames  = 0;
 
 static void BuildLogPath()
 {
+#if MEVR_WINLATORXR
+    // Beside the DLL, on the headset's shared storage: the container's own LOCALAPPDATA lives in
+    // WinlatorXR's private data, which nothing outside the app can read - not even adb.
+    wchar_t self[MAX_PATH];
+    if (g_selfModule && GetModuleFileNameW(g_selfModule, self, MAX_PATH)) {
+        if (wchar_t* slash = wcsrchr(self, L'\\')) {
+            *slash = 0;
+            _snwprintf_s(g_logPath, _TRUNCATE, L"%s\\mevr.log", self);
+            return;
+        }
+    }
+#endif
     wchar_t base[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return;
@@ -398,6 +434,16 @@ static UINT    g_autoEyeW = 0, g_autoEyeH = 0;
 
 static void BuildHeadsetCachePath()
 {
+#if MEVR_WINLATORXR
+    // Beside the DLL with mevr.log, where it can be inspected and deleted over adb.
+    if (g_logPath[0]) {
+        wcscpy_s(g_headsetCachePath, g_logPath);
+        if (wchar_t* slash = wcsrchr(g_headsetCachePath, L'\\')) {
+            wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - g_headsetCachePath), L"headset.txt");
+            return;
+        }
+    }
+#endif
     wchar_t base[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return;
@@ -592,6 +638,80 @@ static bool SyncEngineResolution(UINT w, UINT h, char* whatHappened, size_t what
     return ok;
 }
 
+#if MEVR_WINLATORXR
+// ---- the Quest graphics profile ----
+//
+// Box64 makes every draw call expensive and the Adreno shares its power budget with it, so the
+// engine's costliest passes are turned down before the engine reads its config. Bloom stays: the
+// game's look is built on it. Only keys already in [SystemSettings] are rewritten, and the rest
+// of the file - other sections, comments, line endings - is copied through untouched.
+// WinlatorXrGraphics = game leaves the player's own settings alone.
+static bool g_wxrGraphicsProfile = true;
+static void WxrApplyQuestGraphics()
+{
+    if (!g_wxrGraphicsProfile) { Log("[wxr] graphics: the game's own settings (WinlatorXrGraphics = game)"); return; }
+    static const char* const kKeys[][2] = {
+        { "DynamicShadows", "False" }, { "LightEnvironmentShadows", "False" },
+        { "MotionBlur", "False" }, { "DepthOfField", "False" }, { "AmbientOcclusion", "False" },
+        { "Distortion", "False" }, { "LensFlares", "False" },
+        { "DetailMode", "1" }, { "MaxShadowResolution", "256" }, { "MaxAnisotropy", "2" },
+        { "SkeletalMeshLODBias", "1" }, { "ParticleLODBias", "1" }, { "UseVsync", "False" },
+    };
+    const int kCount = (int)(sizeof(kKeys) / sizeof(kKeys[0]));
+    wchar_t path[MAX_PATH];
+    if (!FindTdEngineIni(path, MAX_PATH)) { Log("[wxr] graphics: TdEngine.ini not found yet - applied from the next launch"); return; }
+    HANDLE h1 = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h1 == INVALID_HANDLE_VALUE) { Log("[wxr] graphics: TdEngine.ini unreadable"); return; }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(h1, &size) || size.QuadPart <= 0 || size.QuadPart > 4 * 1024 * 1024) { CloseHandle(h1); return; }
+    std::string text((size_t)size.QuadPart, '\0');
+    DWORD got = 0;
+    const bool read = ReadFile(h1, &text[0], (DWORD)text.size(), &got, nullptr) && got == text.size();
+    CloseHandle(h1);
+    if (!read) return;
+
+    std::string out;
+    out.reserve(text.size() + 64);
+    bool inSystem = false;
+    int changed = 0, found = 0;
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t e = text.find('\n', i);
+        if (e == std::string::npos) e = text.size();
+        size_t contentEnd = e;
+        if (contentEnd > i && text[contentEnd - 1] == '\r') --contentEnd;
+        const std::string line = text.substr(i, contentEnd - i);
+        if (!line.empty() && line[0] == '[') inSystem = (line == "[SystemSettings]");
+        bool replaced = false;
+        if (inSystem) {
+            for (int k = 0; k < kCount; ++k) {
+                const size_t keyLen = strlen(kKeys[k][0]);
+                if (line.size() > keyLen && line.compare(0, keyLen, kKeys[k][0]) == 0 && line[keyLen] == '=') {
+                    ++found;
+                    const std::string want = std::string(kKeys[k][0]) + "=" + kKeys[k][1];
+                    if (line != want) ++changed;
+                    out += want;
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+        if (!replaced) out += line;
+        out.append(text, contentEnd, e - contentEnd);        // the line's own '\r', if any
+        if (e < text.size()) out += '\n';
+        i = e + 1;
+    }
+    if (!changed) { Log("[wxr] graphics: Quest profile already set (%d of %d keys present)", found, kCount); return; }
+    HANDLE h2 = CreateFileW(path, GENERIC_WRITE, 0, nullptr, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h2 == INVALID_HANDLE_VALUE) { Log("[wxr] graphics: TdEngine.ini not writable"); return; }
+    DWORD written = 0;
+    const bool ok = WriteFile(h2, out.data(), (DWORD)out.size(), &written, nullptr) && written == out.size();
+    CloseHandle(h2);
+    Log("*** [wxr] graphics: Quest profile %s - %d of %d keys changed (shadows, DOF, motion blur,"
+        " distortion, AO, lens flares off; detail medium; bloom kept)", ok ? "written" : "write FAILED", changed, kCount);
+}
+#endif
+
 // ---------------------------------------------------------------- naming helpers
 
 static const char* FormatName(D3DFORMAT f)
@@ -657,6 +777,10 @@ static void* PatchVTable(void* obj, int index, void* repl)
 // ================================================================ OpenXR (rung 2)
 
 #include "xr_diagnostics.inl"
+#if MEVR_WINLATORXR
+#include <process.h>
+#include "winlatorxr.inl"
+#endif
 
 static bool InitXR()
 {
@@ -754,6 +878,13 @@ static bool InitXR()
         }
     }
 
+#if MEVR_WINLATORXR
+    // No D3D11 device: the frame never leaves D3D9 (see winlatorxr_frame.inl). The format is only
+    // what the VR panel's rasterizer reads to pick its byte order, and BGRA is D3D9's A8R8G8B8.
+    g_scFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    XrSessionCreateInfo sci{ XR_TYPE_SESSION_CREATE_INFO };
+    sci.systemId = g_xrSystem;
+#else
     // The D3D11 device MUST be on the adapter the runtime names, not simply the default one.
     PFN_xrGetD3D11GraphicsRequirementsKHR pfn = nullptr;
     XrLogResult("xrGetInstanceProcAddr (D3D11 requirements)",
@@ -785,6 +916,7 @@ static bool InitXR()
     bind.device = g_dev11;
     XrSessionCreateInfo sci{ XR_TYPE_SESSION_CREATE_INFO };
     sci.next = &bind; sci.systemId = g_xrSystem;
+#endif
     XrResult sr = xrCreateSession(g_xrInstance, &sci, &g_xrSession);
     if (!XrLogResult("xrCreateSession", sr)) return false;
 
@@ -7889,7 +8021,13 @@ static bool XrSyncInput(XrTime when)
         flt(g_aLGrip)>.15f || flt(g_aRGrip)>.15f || flt(g_aLTrig)>.15f || flt(g_aRTrig)>.15f ||
         (fabsf(menuMX)>.2f && fabsf(menuLX)>.2f) || (fabsf(menuMY)>.2f && fabsf(menuLY)>.2f);
     bool shortY=false;
-    if(VrMenuInputTick(when,true,bl(g_aY),bl(g_aA)||flt(g_aRTrig)>.5f,bl(g_aB),menuOther,
+#if MEVR_WINLATORXR
+    // Far Cry layout on the headset: the VR panel is on the right stick click, Y is a game button.
+    const bool menuKey=bl(g_aRClick);
+#else
+    const bool menuKey=bl(g_aY);
+#endif
+    if(VrMenuInputTick(when,true,menuKey,bl(g_aA)||flt(g_aRTrig)>.5f,bl(g_aB),menuOther,
         fabsf(menuLX)>fabsf(menuMX)?menuLX:menuMX,
         fabsf(menuLY)>fabsf(menuMY)?menuLY:menuMY,&shortY)) {
         ArmSwingSample(when,false);
@@ -7926,6 +8064,13 @@ static bool XrSyncInput(XrTime when)
     const bool stickJump = StickActionTick(&g_stickJump, when,  ly, lx, "JUMP");
     const bool stickTurn = StickActionTick(&g_stickTurn, when, -ly, lx, "QUICK TURN");
     if (g_stickJumpTurn) s.Gamepad.sThumbRY = 0;
+#if MEVR_WINLATORXR
+    // Headset layout: right stick up jumps, down crouches / slides for as long as it is held,
+    // whatever the hand setting. The 180 degree quick turn is not mapped at all.
+    const bool stickUp   = ly >  0.7f && ly > fabsf(lx);
+    const bool stickDown = ly < -0.7f && -ly > fabsf(lx);
+    s.Gamepad.sThumbRY = 0;
+#endif
 
     // ---- AS.1a: the curve sweep OVERRIDES the left stick while it runs ----
     //
@@ -8005,7 +8150,12 @@ static bool XrSyncInput(XrTime when)
     // A committed roof exit owns movement; do not feed the old synthetic
     // down-then-up sequence or a stale hand-derived shimmy into its animation.
     if (g_pkTopOpen) {s.Gamepad.sThumbLX=0;s.Gamepad.sThumbLY=0;}
+#if MEVR_WINLATORXR
+    // Crouch is the right stick down; the left trigger only fires a left-hand pistol (below).
+    s.Gamepad.bLeftTrigger = stickDown ? 0xFF : 0;
+#else
     s.Gamepad.bLeftTrigger  = (BYTE)(flt(g_aLTrig) * 255.0f);
+#endif
     if (CombatLeftHandGun()) s.Gamepad.bLeftTrigger = 0; // left trigger now fires
     // AS.3: full, and never below what the physical trigger already asked for. GBA_Crouch is
     // a button as far as the game is concerned; a partial press would only risk sitting under
@@ -8020,10 +8170,21 @@ static bool XrSyncInput(XrTime when)
     if (motionPunch) s.Gamepad.bRightTrigger = 0xFF;
 
     WORD b = 0;
+#if MEVR_WINLATORXR
+    // The face buttons are the buttons the game's prompts show; Y is not shared with the VR
+    // panel here (that is the right stick click), so it reaches the game directly.
+    (void)shortY;
+    if (bl(g_aA)) b |= MEVR_PAD_A;
+    if (bl(g_aB)) b |= MEVR_PAD_B;
+    if (bl(g_aX)) b |= MEVR_PAD_X;
+    if (bl(g_aY)) b |= MEVR_PAD_Y;
+    if (stickUp)   b |= MEVR_PAD_LSHOULDER;   // jump
+#else
     if (bl(g_aA)) b |= MEVR_PAD_A;
     if (bl(g_aB)) b |= MEVR_PAD_B;
     if (bl(g_aX)) b |= MEVR_PAD_X;
     if (shortY) b |= MEVR_PAD_Y;
+#endif
     if (bl(g_aMenu))   b |= MEVR_PAD_START;
     // ---- left stick click is BACK, not LTHUMB ----
     //
@@ -8040,7 +8201,9 @@ static bool XrSyncInput(XrTime when)
     // happens here - hand-editing the ini is not an option, the game hash-checks its config and
     // refuses to start, already measured at two runs.
     if (bl(g_aLClick)) b |= MEVR_PAD_BACK;
+#if !MEVR_WINLATORXR
     if (bl(g_aRClick)) b |= MEVR_PAD_RTHUMB;
+#endif
     // Read once and keep: the crossover below, the peaks in the window report, and the hand-pose
     // path all want the same number, and calling flt() twice per grip would sample the runtime
     // twice for one frame's answer.
@@ -8054,7 +8217,9 @@ static bool XrSyncInput(XrTime when)
     // the game at all - a hand closing around nothing must not also jump.
     if (!g_gripToGrip) {
         if (g_gripValue[0] > 0.5f) b |= MEVR_PAD_LSHOULDER;
-        if (g_gripValue[1] > 0.5f) b |= MEVR_PAD_RSHOULDER;
+#if !MEVR_WINLATORXR
+        if (g_gripValue[1] > 0.5f) b |= MEVR_PAD_RSHOULDER;   // no quick turn on the headset
+#endif
     }
     // AS.2: OR, never replace. The grip stays the reliable jump when a gesture misfires, and
     // it is the one a player reaches for when a gap is closing. The stick joins on the same
@@ -8065,7 +8230,11 @@ static bool XrSyncInput(XrTime when)
     // ended and the mode is no longer PK_BAR.
     if (g_pkHoldDrop > 0 && g_pkHoldDropJump) b |= MEVR_PAD_LSHOULDER;
     if (g_pkSwipeHold > 0) b |= MEVR_PAD_LSHOULDER;      // PK.48
-    if (stickJump) b |= MEVR_PAD_LSHOULDER;
+#if !MEVR_WINLATORXR
+    if (stickJump) b |= MEVR_PAD_LSHOULDER;   // the headset's Far Cry layout jumps above
+#else
+    (void)stickJump;
+#endif
     // ---- ⚠️ PK.50: A SWING JUMP NEEDS ITS ARMS, WHOEVER ASKED FOR IT ----
     //
     // Three marked tests settle this. Swinging by hand and releasing failed; swinging by hand and
@@ -8084,7 +8253,11 @@ static bool XrSyncInput(XrTime when)
     // this jump without the mod knowing - test 2 was a physical press with the hands still
     // anchored, and a stand-down keyed only to PK.46's launch would have missed it entirely.
     if (g_pkMode == PK_BAR && (b & MEVR_PAD_LSHOULDER)) g_pkBarJumpHold = kPkBarJumpHold;
-    if (stickTurn) b |= MEVR_PAD_RSHOULDER;
+#if !MEVR_WINLATORXR
+    if (stickTurn) b |= MEVR_PAD_RSHOULDER;   // the headset maps no quick turn
+#else
+    (void)stickTurn;
+#endif
     s.Gamepad.wButtons = b;
 
     // ---- what the GAME was handed, kept live for the parkour probe ----
@@ -8770,7 +8943,7 @@ static bool CaptureFrameShared(IDirect3DDevice9* dev, IDirect3DSurface9* bb, UIN
     return true;
 }
 
-static bool CaptureFrame(IDirect3DDevice9* dev)
+MEVR_DESKTOP_ONLY static bool CaptureFrame(IDirect3DDevice9* dev)
 {
     if (!g_dev11) return false;
     const double t0 = NowMs();
@@ -9129,8 +9302,77 @@ static bool FillEye(int eye)
     return ok;
 }
 
+// Locates both eyes for this frame and derives what follows from them: the IPD the duplication
+// needs and the forced frustum. Shared by the OpenXR frame loop and the WinlatorXR one, which
+// must agree on both or the picture and the submitted FOV come apart.
+static void AdoptLocatedViews(XrTime displayTime)
+{
+    uint32_t viewCount = 0;
+    XrViewState vs{ XR_TYPE_VIEW_STATE };
+    XrViewLocateInfo vli{ XR_TYPE_VIEW_LOCATE_INFO };
+    vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    vli.displayTime = displayTime;
+    vli.space = g_xrSpace;
+    for (int e = 0; e < 2; ++e) g_views[e] = { XR_TYPE_VIEW };
+    if (XR_SUCCEEDED(xrLocateViews(g_xrSession, &vli, &vs, 2, &viewCount, g_views)) &&
+        viewCount == 2 &&
+        (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+        g_viewsValid = true;
+        // Half the real interpupillary distance, in metres, straight from the runtime -
+        // then into UE3 units by the tunable world scale.
+        const float dx = g_views[1].pose.position.x - g_views[0].pose.position.x;
+        const float dy = g_views[1].pose.position.y - g_views[0].pose.position.y;
+        const float dz = g_views[1].pose.position.z - g_views[0].pose.position.z;
+        g_halfIpdUU = 0.5f * sqrtf(dx*dx + dy*dy + dz*dz) * g_worldScale;
+
+        // ---- the target frustum: match the headset's VERTICAL, derive the horizontal ----
+        //
+        // Vertical, not horizontal, and the reference is explicit about why: the game
+        // renders 16:9 while a per-eye view is nearly square, so equal VERTICAL leaves the
+        // horizontal comfortably wider than needed - both axes covered, surplus falling
+        // outside the eye. Matching horizontally instead leaves top and bottom short, which
+        // is the visible half of the aspect mismatch and exactly the letterboxing seen now.
+        float up = 0.0f, dn = 0.0f;
+        for (int e = 0; e < 2; ++e) {
+            if (g_views[e].fov.angleUp   >  up) up = g_views[e].fov.angleUp;
+            if (-g_views[e].fov.angleDown > dn) dn = -g_views[e].fov.angleDown;
+        }
+        const float halfY = (up > dn) ? up : dn;
+        if (halfY > 0.1f && SceneH() > 0) {
+            g_targetHalfFovY = halfY;
+            // Square pixels: the horizontal follows from the aspect of what ONE EYE
+            // actually renders into. Under draw duplication that is half the SCENE, so the
+            // aspect halves - and this single value is used both to force the matrix and to
+            // tell the compositor, which is the only way they can agree. Taking it from the
+            // backbuffer instead would describe the letterbox rather than the picture.
+            const float aspect = g_simulStereo ? ((float)SceneW() * 0.5f / (float)SceneH())
+                                               : ((float)SceneW() / (float)SceneH());
+            g_targetHalfFovX = atanf(tanf(halfY) * aspect);
+#if MEVR_WINLATORXR
+            // On the headset, the headset's own FOV on both axes, as the Far Cry port renders it.
+            // WinlatorXR shows each eye's region of the screen over the FOV it is sent and cannot
+            // show more than its native one: a 132 degree alternate-eye frame was squeezed into
+            // 108.9 and swam with every head turn. Rendering the native frustum makes the mapping
+            // 1:1 whatever the screen; the screen's shape then only decides pixel density, best
+            // at the eye's own ~1.10 (Far Cry's 1792x1624).
+            {
+                float right = 0.0f;
+                for (int e = 0; e < 2; ++e) if (g_views[e].fov.angleRight > right) right = g_views[e].fov.angleRight;
+                if (right > 0.1f) g_targetHalfFovX = right;
+            }
+#endif
+            if (!g_fovLogged) {
+                g_fovLogged = true;
+                Log("[fov] headset wants %.1f deg vertical; targeting %.1f x %.1f at %.2f aspect",
+                    halfY * 114.5916f, g_targetHalfFovX * 114.5916f,
+                    g_targetHalfFovY * 114.5916f, aspect);
+            }
+        }
+    }
+}
+
 // One XR frame: wait, begin, put the captured frame (or the test colour) on the quad, submit.
-static void SubmitTestQuad()
+MEVR_DESKTOP_ONLY static void SubmitTestQuad()
 {
     if (!g_xrRunning) return;
 
@@ -9272,55 +9514,7 @@ static void SubmitTestQuad()
     g_viewsValid = false;
 
     if (g_stereoMode == 1 && g_haveFrame) {
-        uint32_t viewCount = 0;
-        XrViewState vs{ XR_TYPE_VIEW_STATE };
-        XrViewLocateInfo vli{ XR_TYPE_VIEW_LOCATE_INFO };
-        vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-        vli.displayTime = fs.predictedDisplayTime;
-        vli.space = g_xrSpace;
-        for (int e = 0; e < 2; ++e) g_views[e] = { XR_TYPE_VIEW };
-        if (XR_SUCCEEDED(xrLocateViews(g_xrSession, &vli, &vs, 2, &viewCount, g_views)) &&
-            viewCount == 2 &&
-            (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
-            g_viewsValid = true;
-            // Half the real interpupillary distance, in metres, straight from the runtime -
-            // then into UE3 units by the tunable world scale.
-            const float dx = g_views[1].pose.position.x - g_views[0].pose.position.x;
-            const float dy = g_views[1].pose.position.y - g_views[0].pose.position.y;
-            const float dz = g_views[1].pose.position.z - g_views[0].pose.position.z;
-            g_halfIpdUU = 0.5f * sqrtf(dx*dx + dy*dy + dz*dz) * g_worldScale;
-
-            // ---- the target frustum: match the headset's VERTICAL, derive the horizontal ----
-            //
-            // Vertical, not horizontal, and the reference is explicit about why: the game
-            // renders 16:9 while a per-eye view is nearly square, so equal VERTICAL leaves the
-            // horizontal comfortably wider than needed - both axes covered, surplus falling
-            // outside the eye. Matching horizontally instead leaves top and bottom short, which
-            // is the visible half of the aspect mismatch and exactly the letterboxing seen now.
-            float up = 0.0f, dn = 0.0f;
-            for (int e = 0; e < 2; ++e) {
-                if (g_views[e].fov.angleUp   >  up) up = g_views[e].fov.angleUp;
-                if (-g_views[e].fov.angleDown > dn) dn = -g_views[e].fov.angleDown;
-            }
-            const float halfY = (up > dn) ? up : dn;
-            if (halfY > 0.1f && SceneH() > 0) {
-                g_targetHalfFovY = halfY;
-                // Square pixels: the horizontal follows from the aspect of what ONE EYE
-                // actually renders into. Under draw duplication that is half the SCENE, so the
-                // aspect halves - and this single value is used both to force the matrix and to
-                // tell the compositor, which is the only way they can agree. Taking it from the
-                // backbuffer instead would describe the letterbox rather than the picture.
-                const float aspect = g_simulStereo ? ((float)SceneW() * 0.5f / (float)SceneH())
-                                                   : ((float)SceneW() / (float)SceneH());
-                g_targetHalfFovX = atanf(tanf(halfY) * aspect);
-                if (!g_fovLogged) {
-                    g_fovLogged = true;
-                    Log("[fov] headset wants %.1f deg vertical; targeting %.1f x %.1f at %.2f aspect",
-                        halfY * 114.5916f, g_targetHalfFovX * 114.5916f,
-                        g_targetHalfFovY * 114.5916f, aspect);
-                }
-            }
-        }
+        AdoptLocatedViews(fs.predictedDisplayTime);
 
         // Sized to the region FillEye actually copies, or the copy and the swapchain disagree.
         const uint32_t eyeW = g_simulStereo ? (SceneW() / 2) : SceneW();
@@ -14182,7 +14376,11 @@ static void AutoArm()
             return;
         }
         g_stereoMode = 1;
+#if MEVR_WINLATORXR
+        g_simulStereo = !g_wxrAlternateEye;
+#else
         g_simulStereo = true;
+#endif
         g_eyeFilled[0] = g_eyeFilled[1] = false;
         InterlockedExchange(&g_dupDraws, 0);
         g_autoDone = true;
@@ -21495,6 +21693,12 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             if (rl > 1e-6f) {
                 const float s = g_eyeInject * g_halfIpdUU * g_stereoStrength / rl;
                 ox += rx * s; oy += ry * s; oz += rz * s;
+#if MEVR_WINLATORXR
+                // Which eye this frame was really drawn for, counted where it happens: the
+                // prediction at Present assumed a fixed one-frame render lag that Box64 does not
+                // keep, and the left eye flickered whenever a frame reached the wrong one.
+                if (g_eyeInject < 0) ++g_wxrDrawnLeft; else ++g_wxrDrawnRight;
+#endif
             }
         }
         if (g_vmRow) {
@@ -21522,7 +21726,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         // tan(halfFov) = |col3| / |col_n|, so scaling column n by tan(old)/tan(new) sets the new
         // field exactly. All FOUR elements of the column scale, including the translation term
         // the offset just wrote - the scale applies to the whole clip-x mapping, not part of it.
-        if (g_fovForce && oldTanX > 1e-6f && oldTanY > 1e-6f &&
+        if (g_fovForce && !MEVR_WXR_FLAT() && oldTanX > 1e-6f && oldTanY > 1e-6f &&
             g_targetHalfFovX > 0.0f && g_targetHalfFovY > 0.0f) {
             const float sx = oldTanX / tanf(g_targetHalfFovX);
             const float sy = oldTanY / tanf(g_targetHalfFovY);
@@ -21601,7 +21805,11 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
 // uploads must NOT re-enter the injection path, or each would be offset again. One flag,
 // checked first in both hooks.
 
-bool         g_simulStereo = false;          // F10 toggles; alternate-eye remains the fallback
+bool         g_simulStereo = false;
+#if MEVR_WINLATORXR
+// AlternateEye in mevr.ini: arm alternate-eye instead of side-by-side on the headset.
+bool         g_wxrAlternateEye = false;
+#endif          // F10 toggles; alternate-eye remains the fallback
 static bool  g_inDupDraw = false;            // re-entrancy guard
 float        g_sceneMat[16] = { 0 };         // last scene matrix seen at c0, UNMODIFIED
 bool         g_sceneMatValid = false;
@@ -23022,7 +23230,7 @@ static void BuildEyeMatrix(float* out, int eye)
     ApplyYawLag(m, true);
     ApplyCinematicLook(m,true);
     ApplySixDof(m, true);   // a world-space offset, same stage as the per-eye one
-    if (g_fovForce && g_gameFovValid && g_targetHalfFovX > 0.0f) {
+    if (g_fovForce && !MEVR_WXR_FLAT() && g_gameFovValid && g_targetHalfFovX > 0.0f) {
         // ⚠️ Uses g_targetHalfFovX, the SAME number the projection layer submits.
         //
         // The first version computed its own horizontal target here from the half-width
@@ -26347,8 +26555,12 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         // frame. If it fails, g_haveFrame goes false and the quad shows the cycling test
         // colour instead - which makes success and failure distinguishable from inside the
         // headset, without reading the log.
+#if MEVR_WINLATORXR
+        WxrSubmitFrame(dev);
+#else
         g_haveFrame = CaptureFrame(dev);
         SubmitTestQuad();
+#endif
     }
 
     // ---- the object model scan, once, well into the run ----
@@ -26498,7 +26710,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
             // standdown. When the guard re-arms, the else branch resumes forcing by itself.
             static float fovPreForce = 0.0f;
             static bool  fovStoodDown = false;
-            const bool degraded = g_sceneSplitMono || g_scenePartialMono;
+            const bool degraded = g_sceneSplitMono || g_scenePartialMono || MEVR_WXR_FLAT();
             if (degraded) {
                 if (!fovStoodDown && fovPreForce > 1.0f) {
                     fovStoodDown = true;
@@ -26665,6 +26877,9 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PA
     // chain sized to the old one is a format/size mismatch waiting to happen.
     ReleaseFrameCapture();
     ResetEffectShaders();
+#if MEVR_WINLATORXR
+    WxrReleaseDeviceResources();
+#endif
     HRESULT hr = g_origReset(dev, pp);
     Log("--- Reset returned hr=0x%08lX ---", (unsigned long)hr);
     if (FAILED(hr)) {
@@ -27017,7 +27232,13 @@ static bool       g_modeInjectLogged = false;
 
 static bool AutoResolutionModeOnly(UINT realCount)
 {
+#if MEVR_WINLATORXR
+    // On the headset an explicit size is enforced like Auto: offered alone, the engine cannot
+    // keep a saved 4:3 size, which letterboxed the 16:9 picture and cost stereo.
+    return g_forceResW && g_forceResH && realCount != 0;
+#else
     return g_resAuto && g_forceResW && g_forceResH && realCount != 0;
+#endif
 }
 
 static HRESULT ForcedDisplayMode(IDirect3D9* self, UINT adapter, D3DFORMAT fmt,
@@ -27370,6 +27591,26 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion)
     long call = InterlockedIncrement(&g_createCalls);
     Log("*** Direct3DCreate9 CALLED (call #%ld) SDKVersion=%u -> IDirect3D9* %p%s",
         call, SDKVersion, (void*)d3d, g_d3d9ExObj ? "  (Ex)" : "");
+#if MEVR_WINLATORXR
+    // What the container's DXVK and GPU driver expose. A driver that DXVK cannot use leaves no
+    // adapters, and the game then fails inside its own D3D9 setup before it reaches a device.
+    if (d3d && call <= 4) {
+        const UINT adapters = d3d->GetAdapterCount();
+        D3DADAPTER_IDENTIFIER9 id{};
+        D3DCAPS9 caps{};
+        const HRESULT ihr = adapters ? d3d->GetAdapterIdentifier(0, 0, &id) : E_FAIL;
+        const HRESULT chr = adapters ? d3d->GetDeviceCaps(0, D3DDEVTYPE_HAL, &caps) : E_FAIL;
+        Log("[wxr] D3D9 adapters %u; adapter 0 '%s' vendor %04lX device %04lX driver '%s' (hr 0x%08lX);"
+            " caps hr 0x%08lX VS %lu.%lu PS %lu.%lu, max texture %lux%lu",
+            adapters, SUCCEEDED(ihr) ? id.Description : "-", (unsigned long)id.VendorId,
+            (unsigned long)id.DeviceId, SUCCEEDED(ihr) ? id.Driver : "-", (unsigned long)ihr,
+            (unsigned long)chr, (unsigned long)D3DSHADER_VERSION_MAJOR(caps.VertexShaderVersion),
+            (unsigned long)D3DSHADER_VERSION_MINOR(caps.VertexShaderVersion),
+            (unsigned long)D3DSHADER_VERSION_MAJOR(caps.PixelShaderVersion),
+            (unsigned long)D3DSHADER_VERSION_MINOR(caps.PixelShaderVersion),
+            caps.MaxTextureWidth, caps.MaxTextureHeight);
+    }
+#endif
 
     // Patched once. All IDirect3D9 instances share a vtable, so this covers both the
     // throwaway and the real one - and the `self` argument in the hook reports which is
@@ -27671,6 +27912,43 @@ static void LoadSettingsFile()
         // and inverted into the FOLLOW flags the code carries. Naming them "follow" in the file
         // would invert the meaning of `0` relative to every conversation about them.
         bool b = false;
+#if MEVR_WINLATORXR
+        if (_stricmp(key, "WinlatorXrGraphics") == 0) {
+            if (_stricmp(val, "quest") == 0) g_wxrGraphicsProfile = true;
+            else if (_stricmp(val, "game") == 0) g_wxrGraphicsProfile = false;
+            else { Log("[cfg]   WinlatorXrGraphics = %s  (quest or game - ignored)", val); rejected++; continue; }
+            Log("[cfg]   WinlatorXrGraphics = %s", g_wxrGraphicsProfile ? "quest" : "game");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrKeyboardMouse") == 0) {
+            if (!SettingBool(val, &b)) { Log("[cfg]   WinlatorXrKeyboardMouse = %s  (not on/off - ignored)", val); rejected++; continue; }
+            g_wxrBlockKeyboardMouse = !b;
+            Log("[cfg]   WinlatorXrKeyboardMouse = %s  (%s)", b ? "on" : "off",
+                b ? "WinlatorXR's emulated keys and mouse reach the game" : "gamepad only");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrGripPitch") == 0) {
+            char* end = nullptr; const float f = strtof(val, &end);
+            if (end == val || *end || !std::isfinite(f) || f < -90 || f > 90) {
+                Log("[cfg]   WinlatorXrGripPitch = %s  (needs -90..90 degrees - ignored)", val); rejected++; continue;
+            }
+            wxr::g_gripPitchDeg = f;
+            Log("[cfg]   WinlatorXrGripPitch = %.0f  (controller grip = aim pitched up this far)", f);
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "AlternateEye") == 0) {
+            if (_stricmp(val, "on") == 0 || strcmp(val, "1") == 0) g_wxrAlternateEye = true;
+            else if (_stricmp(val, "off") == 0 || strcmp(val, "0") == 0) g_wxrAlternateEye = false;
+            else { Log("[cfg]   AlternateEye = %s  (not on/off - ignored)", val); rejected++; continue; }
+            Log("[cfg]   AlternateEye = %s  (WinlatorXR: %s)", g_wxrAlternateEye ? "on" : "off",
+                g_wxrAlternateEye ? "one eye per frame, full width, half the draw calls" : "both eyes side by side every frame");
+            applied++;
+            continue;
+        }
+#endif
         if (_stricmp(key, "FrameCap") == 0) {
             char* end=nullptr; const float f=strtof(val,&end);
             if (_stricmp(val,"unlimited")==0 || strcmp(val,"0")==0) {
@@ -28106,6 +28384,14 @@ static void LoadSettings()
     g_resAuto = true;
     g_forceResW = g_forceResH = g_autoEyeW = g_autoEyeH = 0;
     LoadSettingsFile();
+#if MEVR_WINLATORXR
+    if (!g_resAuto && g_forceResW && g_forceResH) {
+        char what[256] = "";
+        const bool ok = SyncEngineResolution(g_forceResW, g_forceResH, what, sizeof(what));
+        Log("[cfg]   Resolution: %s%s", what, ok ? "" : "  (*** the engine may keep its own size)");
+        return;
+    }
+#endif
     if (!g_resAuto) return;
     if (!ReadHeadsetCache(&g_autoEyeW, &g_autoEyeH)) {
         g_forceResW = g_forceResH = 0;
@@ -28131,6 +28417,119 @@ static void LoadSettings()
 
 #include "vr_menu.inl"
 #include "vr_controls.inl"
+#if MEVR_WINLATORXR
+#include "winlatorxr_input.inl"
+#include "winlatorxr_frame.inl"
+#endif
+
+#if MEVR_WINLATORXR
+static void __cdecl WxrPureCallReport(const DWORD* sp, DWORD thisPtr);
+#endif
+#if MEVR_WINLATORXR
+// ---- who made a pure virtual call ----
+//
+// On the headset the engine stopped at its "Pure virtual function being called while application
+// was running" box in the main menu. That is not an exception, so the first-chance logger cannot
+// see it. The engine's handler is hooked instead - located for this GOG build, refused for any
+// other - and records the call site and the object before the engine's own handler runs.
+static void (__cdecl *g_origPureCall)() = nullptr;
+static void LogExeStack(const DWORD* sp, const char* what)
+{
+    char trace[512] = "";
+    for (int i = 0, n = 0; i < 400 && n < 16; ++i) {
+        DWORD v = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), sp + i, &v, 4, nullptr)) break;
+        if (v >= 0x00401000 && v < 0x01A8B000) {
+            char item[16]; sprintf_s(item, " %08lX", (unsigned long)v); strcat_s(trace, item); ++n;
+        }
+    }
+    Log("[wxr]   %s exe addresses on the stack:%s", what, trace);
+}
+static void __declspec(naked) WxrPureCallThunk()
+{
+    __asm {
+        pushad
+        push ecx
+        lea eax, [esp + 36]
+        push eax
+        call WxrPureCallReport
+        add esp, 8
+        popad
+        jmp dword ptr [g_origPureCall]
+    }
+}
+#endif
+
+#if MEVR_WINLATORXR
+static void __cdecl WxrPureCallReport(const DWORD* sp, DWORD thisPtr)
+{
+    DWORD caller = 0, vtable = 0;
+    ReadProcessMemory(GetCurrentProcess(), sp, &caller, 4, nullptr);
+    ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)thisPtr, &vtable, 4, nullptr);
+    Log("*** [wxr] PURE VIRTUAL CALL on thread %lu: returns to %08lX, ecx %08lX (vtable %08lX), frame %ld",
+        GetCurrentThreadId(), (unsigned long)caller, (unsigned long)thisPtr, (unsigned long)vtable, g_frames);
+    LogExeStack(sp, "pure call:");
+}
+static void WxrHookPureCall()
+{
+    void* at = (void*)0x010F1980;
+    static const BYTE expect[] = { 0x83, 0x3D, 0x74, 0x93, 0x03, 0x02, 0x00 };
+    BYTE got[sizeof(expect)] = {};
+    if (!ReadProcessMemory(GetCurrentProcess(), at, got, sizeof(got), nullptr) || memcmp(got, expect, sizeof(expect))) {
+        Log("[wxr] pure-call handler not at the GOG 1.01 address - not watched");
+        return;
+    }
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) return;
+    if (MH_CreateHook(at, (void*)&WxrPureCallThunk, (void**)&g_origPureCall) == MH_OK && MH_EnableHook(at) == MH_OK)
+        Log("[wxr] pure-call handler watched");
+}
+#endif
+
+#if MEVR_WINLATORXR
+// ---- the first exceptions, before the engine's handler sees them ----
+//
+// On the headset the engine can fail during startup, catch its own fault, and exit - and this
+// shipping build writes no log of its own, so the cause is otherwise invisible: Wine only reports
+// the unhandled crash that follows in the shutdown path. A first-chance handler records the first
+// few exceptions with the module and registers, and passes every one of them on untouched.
+static volatile LONG g_wxrExceptions = 0;
+static LONG CALLBACK WxrFirstChance(PEXCEPTION_POINTERS info)
+{
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    // C++ throws and debugger chatter are not faults.
+    if (code == 0xE06D7363 || code == 0x406D1388 || code == DBG_PRINTEXCEPTION_C || code == 0x4001000A ||
+        code == 0x6BA /* RPC server unavailable: Wine's rpcss, harmless */)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&g_wxrExceptions) > 6) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t at = (uintptr_t)info->ExceptionRecord->ExceptionAddress;
+    char module[MAX_PATH] = "?";
+    HMODULE owner = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)at, &owner) && owner)
+        GetModuleFileNameA(owner, module, MAX_PATH);
+    const CONTEXT* c = info->ContextRecord;
+    Log("*** [wxr] first-chance exception %08lX at %08lX (%s+%lX), access %s %08lX |"
+        " eax %08lX ebx %08lX ecx %08lX edx %08lX esi %08lX edi %08lX ebp %08lX esp %08lX",
+        (unsigned long)code, (unsigned long)at, strrchr(module, '\\') ? strrchr(module, '\\') + 1 : module,
+        (unsigned long)(at - (uintptr_t)owner),
+        info->ExceptionRecord->NumberParameters >= 2 ? (info->ExceptionRecord->ExceptionInformation[0] ? "write" : "read") : "-",
+        (unsigned long)(info->ExceptionRecord->NumberParameters >= 2 ? info->ExceptionRecord->ExceptionInformation[1] : 0),
+        c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+    // The return chain: the faulting function's callers, read from the stack conservatively.
+    char trace[400] = "";
+    const DWORD* sp = (const DWORD*)c->Esp;
+    for (int i = 0, n = 0; i < 256 && n < 10; ++i) {
+        DWORD v = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), sp + i, &v, 4, nullptr)) break;
+        if (v >= 0x00401000 && v < 0x01A8B000) {
+            char item[16]; sprintf_s(item, " %08lX", (unsigned long)v); strcat_s(trace, item); ++n;
+        }
+    }
+    Log("[wxr]   exe addresses on the stack:%s", trace);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
 
 BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
 {
@@ -28153,6 +28552,32 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
         // log rather than something to be inferred from behaviour further down.
         LoadSettings();
         VrMenuInitializeSettings();
+#if MEVR_WINLATORXR
+        AddVectoredExceptionHandler(1, WxrFirstChance);
+        WxrInstallInputBlock();
+        WxrApplyQuestGraphics();
+        WxrHookPureCall();
+        LogAddressSpace("at load");
+        // The emulator's settings decide whether the engine's threads see each other's writes in
+        // order (BOX64_DYNAREC_STRONGMEM). Wine copies the Linux environment, so they are visible.
+        if (LPWCH env = GetEnvironmentStringsW()) {
+            int shown = 0;
+            for (LPWCH e = env; *e; e += wcslen(e) + 1)
+                if (!_wcsnicmp(e, L"BOX64_", 6) || !_wcsnicmp(e, L"BOX86_", 6) || !_wcsnicmp(e, L"FEX_", 4) ||
+                    !_wcsnicmp(e, L"DXVK_", 5) || !_wcsnicmp(e, L"WINEDLLOVERRIDES", 16)) {
+                    Log("[wxr] env %S", e);
+                    ++shown;
+                }
+            if (!shown) Log("[wxr] env: no BOX64_/FEX_/DXVK_ variables visible to the game");
+            FreeEnvironmentStringsW(env);
+        }
+        {
+            MEMORYSTATUSEX ms{ sizeof(ms) };
+            GlobalMemoryStatusEx(&ms);
+            Log("[wxr] memory: physical %llu MB free of %llu MB, virtual %llu MB free of %llu MB",
+                ms.ullAvailPhys >> 20, ms.ullTotalPhys >> 20, ms.ullAvailVirtual >> 20, ms.ullTotalVirtual >> 20);
+        }
+#endif
     } else if (reason == DLL_PROCESS_DETACH) {
         Log("");
         Log("=== SUMMARY ===");

@@ -461,6 +461,20 @@ static bool VrMenuInputTick(XrTime, bool focused,bool y,bool a,bool b,bool other
     const auto events=g_menuInput.sample(now,input,g_menuOpen);
     if(events.open)MenuOpen(now);
     if(events.close && !g_menuClosing)MenuClose();
+#if MEVR_WINLATORXR
+    // On the headset the open key is the right stick click, and a short click toggles the panel
+    // (holding it still works). Closed, the state machine reports the short release; open, it
+    // does not, so the release is timed here.
+    {
+        static uint64_t downAt=0;static bool wasDown=false;
+        if(y&&!wasDown)downAt=now;
+        if(!y&&wasDown&&now-downAt<800) {
+            if(events.shortY&&!g_menuOpen)MenuOpen(now);
+            else if(g_menuOpen&&!g_menuClosing&&!events.open)MenuClose();
+        }
+        wasDown=y;
+    }
+#endif
     if(events.shortY)g_menuYUntil=now+100;
     if(g_menuOpen && !g_menuClosing) {
         int count=0;const auto* items=MenuItems(&count);
@@ -564,22 +578,31 @@ static void MenuRasterize(int count,const MenuItem* items,const char values[][64
             MenuText(40,949,"B: BACK   HOLD Y: CLOSE",3,green);MenuText(960,949,fpsText,3,green);
         } else MenuText(20,20,fpsText,5,green);
 }
-static bool VrMenuLayer(XrCompositionLayerQuad* layer) {
-    static double fpsAt=0;static int fpsFrames=0;static float fps=0;
+// Once per frame: counts the frame rate and says whether the panel or the FPS readout is up.
+static float g_menuFpsValue=0;
+static bool VrMenuTickVisible() {
+    static double fpsAt=0;static int fpsFrames=0;
     const double now=NowMs();++fpsFrames;
-    if(now-fpsAt>=500){fps=(float)(fpsFrames*1000.0/(now-fpsAt));fpsFrames=0;fpsAt=now;}
-    if(!g_menuOpen && !g_menuFps)return false;
-    if(!MenuEnsureSwapchain())return false;
+    if(now-fpsAt>=500){g_menuFpsValue=(float)(fpsFrames*1000.0/(now-fpsAt));fpsFrames=0;fpsAt=now;}
+    return g_menuOpen || g_menuFps;
+}
+// Redraws g_menuPixels when anything shown changed; true when it did.
+static bool VrMenuRasterizeIfChanged() {
     int count=0;const auto* items=MenuItems(&count);
     std::string signature=g_menuStatus;signature+=std::to_string(g_menuPage)+":"+std::to_string(g_menuRow);
     signature+=g_menuOpen?"OPEN":"FPS";
-    char fpsText[48];sprintf_s(fpsText,"%.0f FPS",(double)fps);signature+=fpsText;
+    char fpsText[48];sprintf_s(fpsText,"%.0f FPS",(double)g_menuFpsValue);signature+=fpsText;
     char values[8][64]{};for(int i=0;i<count;++i){MenuValue(items[i].id,values[i],sizeof(values[i]));signature+=values[i];}
-    if(signature!=g_menuLastImage) {
-        MenuRasterize(count,items,values,fpsText);
+    if(signature==g_menuLastImage)return false;
+    MenuRasterize(count,items,values,fpsText);
+    g_menuLastImage=signature;
+    return true;
+}
+static bool VrMenuLayer(XrCompositionLayerQuad* layer) {
+    if(!VrMenuTickVisible())return false;
+    if(!MenuEnsureSwapchain())return false;
+    if(VrMenuRasterizeIfChanged())
         g_ctx11->UpdateSubresource(g_menuUpload,0,nullptr,g_menuPixels.data(),kMenuW*4,0);
-        g_menuLastImage=signature;
-    }
     uint32_t index=0;XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     if(XR_FAILED(xrAcquireSwapchainImage(g_menuSwap,&ai,&index)))return false;
     XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wi.timeout=XR_INFINITE_DURATION;

@@ -22,6 +22,7 @@ Second four-run capture analysis: [RELEASE_PARITY_2026-09-19.md](RELEASE_PARITY_
 Missing-smoke investigation (tabled; also reported in flat mode, GOG/Steam difference unresolved): [SMOKE_RELEASE_2026-09-19.md](SMOKE_RELEASE_2026-09-19.md).
 Steam PhysX freeze reports and optional local capture tools: [STEAM_PHYSX_2026-09-19.md](STEAM_PHYSX_2026-09-19.md).
 OpenXR startup diagnostics and failure-capture validation: [OPENXR_DIAGNOSTICS_2026-09-20.md](OPENXR_DIAGNOSTICS_2026-09-20.md).
+Standalone Quest port through WinlatorXR (XrAPI runtime, joypad controls; headset verification pending): [WINLATORXR_2026-10-06.md](WINLATORXR_2026-10-06.md).
 
 | Note | Scope |
 |---|---|
