@@ -27357,7 +27357,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDS(IDirect3DDevice9* dev, UINT w, UI
 // outer - inner is the mod's own cost; a set of heavy state calls the mod does not hook gets an
 // outer timer only (pure DXVK cost). One call in 8 is timed and scaled, keeping the timers'
 // own cost (QueryPerformanceCounter ~0.45 us on the headset) small.
-static bool g_wxrProfile = true;
+static bool g_wxrProfile = false;   // diagnostic only: its own timer calls (~0.45 us each on the headset) cost ~2-3 ms a frame
 struct WxrProfSlot { const char* name; void* outerReal; void* innerReal; double outerMs, innerMs; long calls; bool hooked; };
 static WxrProfSlot g_wxrProf[120];
 static double g_wxrProfTick = 0.0;     // ms per QPC tick
