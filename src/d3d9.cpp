@@ -220,6 +220,7 @@ static int   g_wxrPoseLag = 0;
 static bool  g_wxrYawCorrection = true;
 static float g_wxrYawCorrRad = 0.0f;
 static float WxrYawCorrectionForFrame(int eye);   // winlatorxr_frame.inl
+static void  ApplyWxrYawCorrection(float* m, bool rowStorage);   // beside ApplyYawLag
 // True while the player is not in control (cinematic camera, cinematic mode, paused): the mod
 // renders the game's own mono view for the 2D screen and stands its FOV force down.
 static volatile bool g_wxrFlat = false;
@@ -21951,12 +21952,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         ApplyYawFix(m, g_vmRow);
         ApplyYawLag(m, g_vmRow);
 #if MEVR_WINLATORXR
-        if (g_wxrYawCorrection && fabsf(g_wxrYawCorrRad) > 1e-5f && (g_livePivotValid || g_camCacheValid)) {
-            const float up[3] = { 0.0f, 0.0f, 1.0f };
-            // A positive angle LOWERS the rotator's yaw (see ApplyYawLag); the correction is the
-            // yaw the camera should GAIN, so it goes in negated.
-            ApplyCameraRotation(m, g_vmRow, up, -g_wxrYawCorrRad, RotationPivot());
-        }
+        ApplyWxrYawCorrection(m, g_vmRow);
 #endif
         ApplySixDof(m, g_vmRow);
         ApplyRoll(m, g_vmRow);
@@ -23350,6 +23346,20 @@ static void ApplyYawLag(float* m, bool rowStorage)
     // a head movement rather than a matrix error.
     ApplyCameraRotation(m, rowStorage, up, g_yawLagRad, RotationPivot());
 }
+
+#if MEVR_WINLATORXR
+// WinlatorXR alternate-eye: turn this frame by the head yaw its eye's measured lag missed
+// (g_wxrYawCorrRad, set at the frame's first eye-offset injection).
+static void ApplyWxrYawCorrection(float* m, bool rowStorage)
+{
+    if (g_cinematicLook || !g_wxrYawCorrection || fabsf(g_wxrYawCorrRad) < 1e-5f) return;
+    if (!g_livePivotValid && !g_camCacheValid) return;
+    const float up[3] = { 0.0f, 0.0f, 1.0f };
+    // A positive angle LOWERS the rotator's yaw (see ApplyYawLag); the correction is the yaw the
+    // camera should GAIN, so it goes in negated.
+    ApplyCameraRotation(m, rowStorage, up, -g_wxrYawCorrRad, RotationPivot());
+}
+#endif
 
 // ---- lock the animation's yaw out of the view ----
 //
