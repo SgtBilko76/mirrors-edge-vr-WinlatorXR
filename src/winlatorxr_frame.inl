@@ -621,8 +621,16 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
         QueryPerformanceCounter(&t2);
         for (int i = 0; i < 1000; ++i) GetAsyncKeyState(VK_F1 + (i & 7));
         QueryPerformanceCounter(&t3);
+        LARGE_INTEGER t4, t5;
+        static volatile uint32_t sink = 0;
+        for (int i = 0; i < 1000; ++i) { uint32_t v = (uint32_t)i; SIZE_T w; WriteProcessMemory(GetCurrentProcess(), (LPVOID)&sink, &v, 4, &w); }
+        QueryPerformanceCounter(&t4);
+        for (int i = 0; i < 1000; ++i) (void)NowMs();
+        QueryPerformanceCounter(&t5);
         const double us = 1.0e6 / (double)qf.QuadPart / 1000.0;
-        Log("[perf] per call: ReadProcessMemory %.2f us, direct read %.3f us, GetAsyncKeyState %.2f us",
-            (t1.QuadPart - t0.QuadPart) * us, (t2.QuadPart - t1.QuadPart) * us, (t3.QuadPart - t2.QuadPart) * us);
+        Log("[perf] per call: ReadProcessMemory %.2f us, direct read %.3f us, GetAsyncKeyState %.2f us,"
+            " WriteProcessMemory %.2f us, NowMs %.2f us",
+            (t1.QuadPart - t0.QuadPart) * us, (t2.QuadPart - t1.QuadPart) * us, (t3.QuadPart - t2.QuadPart) * us,
+            (t4.QuadPart - t3.QuadPart) * us, (t5.QuadPart - t4.QuadPart) * us);
     }
 }

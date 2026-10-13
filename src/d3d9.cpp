@@ -9797,7 +9797,10 @@ static volatile LONG g_objModelThreadFinished = 0;
 // path copies directly and catches a bad address with SEH instead. WinlatorXrFastRead = off
 // restores the ReadProcessMemory path.
 #if MEVR_WINLATORXR
-static bool g_fastSafeRead = true;
+// Off by default: measured on the Quest, ReadProcessMemory costs only ~1.3 us, while every
+// fault the direct path takes costs far more under Box64 (the object scan, which probes
+// thousands of bad pointers, stalled and stereo never started).
+static bool g_fastSafeRead = false;
 #else
 static const bool g_fastSafeRead = false;
 #endif
@@ -11719,10 +11722,71 @@ struct ArmUpdateTiming {
     }
 };
 
+// Where the arm update's time goes, per phase, summed over 600 calls. On the Quest the mod's
+// share measured ~25 ms a call against 0.5 ms under desktop Wine.
+static const char* const kArmPhaseNames[13] = {
+    "restore overrides", "game Update1pArms", "combat hooks init", "combat tick", "parkour pipe",
+    "geom census", "pose read/reanchor", "hand position IK", "detached shoulders", "wrist rotations",
+    "combat report", "arm continuity", "finger probe" };
+static double g_armPhaseMs[13] = {};
+static long g_armPhaseCalls = 0;
+struct ArmPhaseTimer {
+    LARGE_INTEGER last;
+    ArmPhaseTimer() { QueryPerformanceCounter(&last); }
+    void Mark(int phase) {
+        LARGE_INTEGER now, f;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&f);
+        g_armPhaseMs[phase] += (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)f.QuadPart;
+        last = now;
+    }
+    ~ArmPhaseTimer() {
+        if (++g_armPhaseCalls < 600) return;
+        char line[900]; int at = 0;
+        for (int i = 0; i < 13; ++i)
+            at += sprintf_s(line + at, sizeof(line) - at, "%s%s %.2f", i ? ", " : "", kArmPhaseNames[i],
+                            g_armPhaseMs[i] / g_armPhaseCalls);
+        Log("[perf] arm phases, mean ms per call: %s", line);
+        memset(g_armPhaseMs, 0, sizeof(g_armPhaseMs));
+        g_armPhaseCalls = 0;
+    }
+};
+
+// Where the arm update's time goes, per phase, summed over 600 calls. On the Quest the mod's
+// share measured ~25 ms a call against 0.5 ms under desktop Wine.
+static const char* const kArmPhaseNames[13] = {
+    "restore overrides", "game Update1pArms", "combat hooks init", "combat tick", "parkour pipe",
+    "geom census", "pose read/reanchor", "hand position IK", "detached shoulders", "wrist rotations",
+    "combat report", "arm continuity", "finger probe" };
+static double g_armPhaseMs[13] = {};
+static long g_armPhaseCalls = 0;
+struct ArmPhaseTimer {
+    LARGE_INTEGER last;
+    ArmPhaseTimer() { QueryPerformanceCounter(&last); }
+    void Mark(int phase) {
+        LARGE_INTEGER now, f;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&f);
+        g_armPhaseMs[phase] += (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)f.QuadPart;
+        last = now;
+    }
+    ~ArmPhaseTimer() {
+        if (++g_armPhaseCalls < 600) return;
+        char line[900]; int at = 0;
+        for (int i = 0; i < 13; ++i)
+            at += sprintf_s(line + at, sizeof(line) - at, "%s%s %.2f", i ? ", " : "", kArmPhaseNames[i],
+                            g_armPhaseMs[i] / g_armPhaseCalls);
+        Log("[perf] arm phases, mean ms per call: %s", line);
+        memset(g_armPhaseMs, 0, sizeof(g_armPhaseMs));
+        g_armPhaseCalls = 0;
+    }
+};
+
 static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, void* result)
 {
     if (!g_origUpdate1pArms) return;
     ArmUpdateTiming timing;
+    ArmPhaseTimer ph;
     // The preceding frame may have borrowed a dormant controller for the left shoulder. Always
     // put the authored tree and controller bytes back before Mirror's Edge updates parkour,
     // weapon, or root-offset ownership for this tick.
@@ -11732,13 +11796,18 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
     RestoreWristRotationOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
     RestoreDetachedArmOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
     RestoreMotionHandPositionOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
+    ph.Mark(0);
     const double gameStarted = NowMs();
     g_origUpdate1pArms(self, edx, stack, result);
     timing.gameMs = NowMs() - gameStarted;
+    ph.Mark(1);
     if (g_menuBlocksGameplay || g_standardControllerActive) return;
     InitializeCombatHooks(reinterpret_cast<uintptr_t>(self));
+    ph.Mark(2);
     CombatGameplayTick(reinterpret_cast<uintptr_t>(self));
+    ph.Mark(3);
     PkPipeGameTick(reinterpret_cast<uintptr_t>(self));
+    ph.Mark(4);
 
     // These are exploratory comparisons only; gameplay does not use their results.
     // Their full GObjects scans stalled the first ledge grab for 2.7 seconds.
@@ -11748,6 +11817,7 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
         PkAskCanShimmy();
     }
 
+    ph.Mark(5);
     static volatile LONG calls = 0;
     const LONG call = InterlockedIncrement(&calls);
     if (call == 1)
@@ -11757,13 +11827,20 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
     P13PoseSnapshot pose{};
     ReadP13PoseSnapshot(&pose);   // an unreadable snapshot remains invalid and releases ownership
     LateReanchorP13Pose(reinterpret_cast<uintptr_t>(self), &pose);
+    ph.Mark(6);
     ApplyMotionHandPosition(reinterpret_cast<uintptr_t>(self), pose);
+    ph.Mark(7);
     ApplyDetachedShoulders(reinterpret_cast<uintptr_t>(self), pose);
+    ph.Mark(8);
     ApplyWristRotations(reinterpret_cast<uintptr_t>(self), pose);
+    ph.Mark(9);
     ReportCombatState(reinterpret_cast<uintptr_t>(self));
+    ph.Mark(10);
     MonitorArmContinuity(reinterpret_cast<uintptr_t>(self), pose);
+    ph.Mark(11);
     // Last, so the finger span it reads has every override this frame already applied to it.
     ProbeFingerBones(reinterpret_cast<uintptr_t>(self));
+    ph.Mark(12);
 }
 
 // Memoized once it succeeds. The census below walks up to 3000 UObjects and prints its own
