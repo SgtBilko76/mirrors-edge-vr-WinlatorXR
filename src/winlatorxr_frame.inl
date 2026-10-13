@@ -434,28 +434,50 @@ static int  g_wxrLagChosen[2] = { 0, 0 };
 
 static int g_wxrLagSign[2] = { 1, 1 };
 
-// Called on the render thread at the first eye-offset injection of a frame; the ring is only
-// written at Present on the same thread, so it is stable here.
+// Called on the render thread at the first eye-offset injection of a frame, right after the
+// frame's drawn camera yaw was read (g_wxrDrawnYaw); the ring is only written at Present on the
+// same thread, so it is stable here.
+//
+// Per-frame yaw lock (2026-10-13). A headset video showed the picture stepping back and forth
+// by ~30 px between consecutive frames during a steady head turn: some frames are drawn with the
+// newest controller yaw, some with the one before, in no fixed pattern (the per-eye lag
+// measurement kept changing), and every frame is stamped with the newest pose. So each frame is
+// turned until its drawn yaw matches the newest controller yaw: d = drawnYaw - newestCtlYaw is
+// constant (the camera's fixed offset from the controller) whenever the frame is on time, and
+// that offset is learned only while the head is still - when every lag gives the same yaw.
+// A deviation above kMax is taken as the game moving the camera itself (animation, cutscene
+// handover) and re-learned instead of corrected.
+static int WxrWrapYaw(float d) { while (d > 32768.0f) d -= 65536.0f; while (d < -32768.0f) d += 65536.0f; return (int)d; }
+static float g_wxrLockOffset = 0.0f;
+static bool  g_wxrLockOffsetValid = false;
+static double g_wxrLockSum = 0.0, g_wxrLockMax = 0.0;
+static long  g_wxrLockFrames = 0, g_wxrLockResyncs = 0;
+
 static float WxrYawCorrectionForFrame(int eye)
 {
-    if (!g_wxrYawCorrection || eye < 0 || eye > 1 || g_wxrPosePushes < 6 || g_wxrLagSamples[eye] < 40)
+    (void)eye;
+    if (!g_wxrYawCorrection || g_wxrPosePushes < 4) return 0.0f;
+    const WxrPoseRec& r0 = g_wxrPoseRing[(g_wxrPosePushes - 1) & 7];
+    const WxrPoseRec& r1 = g_wxrPoseRing[(g_wxrPosePushes - 2) & 7];
+    const WxrPoseRec& r2 = g_wxrPoseRing[(g_wxrPosePushes - 3) & 7];
+    if (!r0.valid || !r1.valid || !r2.valid) return 0.0f;
+    // drawn yaw is the heading of the RIGHT axis: rotator yaw + 16384
+    const float d = (float)WxrWrapYaw(g_wxrDrawnYaw - (float)r0.yaw);
+    const bool still = abs(WxrWrapYaw((float)(r0.yaw - r1.yaw))) < 20 && abs(WxrWrapYaw((float)(r1.yaw - r2.yaw))) < 20;
+    if (!g_wxrLockOffsetValid || still) {
+        if (!g_wxrLockOffsetValid) { g_wxrLockOffset = d; g_wxrLockOffsetValid = true; }
+        else g_wxrLockOffset = (float)WxrWrapYaw(g_wxrLockOffset + 0.2f * (float)WxrWrapYaw(d - g_wxrLockOffset));
         return 0.0f;
-    const int lag = g_wxrLagChosen[eye];
-    if (lag <= 0) return 0.0f;
-    const WxrPoseRec& now = g_wxrPoseRing[(g_wxrPosePushes - 1) & 7];
-    const WxrPoseRec& used = g_wxrPoseRing[(g_wxrPosePushes - 1 - lag) & 7];
-    if (!now.valid || !used.valid) return 0.0f;
-    float d = (float)(now.yaw - used.yaw);
-    while (d > 32768.0f) d -= 65536.0f;
-    while (d < -32768.0f) d += 65536.0f;
-    float rad = d * (3.14159265f / 32768.0f) * (float)g_wxrLagSign[eye];
-    const float kMax = 20.0f * (3.14159265f / 180.0f);
-    if (rad > kMax) rad = kMax;
-    if (rad < -kMax) rad = -kMax;
-    return rad;
+    }
+    const float err = (float)WxrWrapYaw(d - g_wxrLockOffset);       // UE units the frame is off by
+    const float kMax = 12.0f * 65536.0f / 360.0f;
+    if (fabsf(err) > kMax) { g_wxrLockOffset = d; ++g_wxrLockResyncs; return 0.0f; }
+    g_wxrLockSum += fabsf(err); if (fabsf(err) > g_wxrLockMax) g_wxrLockMax = fabsf(err); ++g_wxrLockFrames;
+    // The camera must LOSE err of yaw (drawn - wanted); ApplyWxrYawCorrection turns by
+    // -g_wxrYawCorrRad, i.e. adds that much yaw, so return -err.
+    return -err * (3.14159265f / 32768.0f);
 }
 
-static int WxrWrapYaw(float d) { while (d > 32768.0f) d -= 65536.0f; while (d < -32768.0f) d += 65536.0f; return (int)d; }
 
 static void WxrPushPose(int sync)
 {
@@ -508,6 +530,11 @@ static int WxrStampSync(int eye, int newestSync, long frame)
     prevCam = cam; prevPushes = haveCam ? g_wxrPosePushes : -10;
 
     if ((frame % 600) == 0) {
+        if (g_wxrYawCorrection)
+            Log("[wxr] yaw lock: %ld turning frames corrected, mean %.2f deg max %.2f deg, %ld re-learns",
+                g_wxrLockFrames, g_wxrLockFrames ? g_wxrLockSum / g_wxrLockFrames * 360.0 / 65536.0 : 0.0,
+                g_wxrLockMax * 360.0 / 65536.0, g_wxrLockResyncs);
+        g_wxrLockSum = g_wxrLockMax = 0.0; g_wxrLockFrames = 0;
         for (int e = 0; e < 2; ++e) {
             auto m = [&](int L) { return (std::min)(g_wxrLagErr[e][L][0], g_wxrLagErr[e][L][1]); };
             Log("[wxr] pose lag %s eye: error lag0 %.0f lag1 %.0f lag2 %.0f lag3 %.0f UU over %ld turning frames"
