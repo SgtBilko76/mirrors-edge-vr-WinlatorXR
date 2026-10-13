@@ -11752,36 +11752,6 @@ struct ArmPhaseTimer {
     }
 };
 
-// Where the arm update's time goes, per phase, summed over 600 calls. On the Quest the mod's
-// share measured ~25 ms a call against 0.5 ms under desktop Wine.
-static const char* const kArmPhaseNames[13] = {
-    "restore overrides", "game Update1pArms", "combat hooks init", "combat tick", "parkour pipe",
-    "geom census", "pose read/reanchor", "hand position IK", "detached shoulders", "wrist rotations",
-    "combat report", "arm continuity", "finger probe" };
-static double g_armPhaseMs[13] = {};
-static long g_armPhaseCalls = 0;
-struct ArmPhaseTimer {
-    LARGE_INTEGER last;
-    ArmPhaseTimer() { QueryPerformanceCounter(&last); }
-    void Mark(int phase) {
-        LARGE_INTEGER now, f;
-        QueryPerformanceCounter(&now);
-        QueryPerformanceFrequency(&f);
-        g_armPhaseMs[phase] += (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)f.QuadPart;
-        last = now;
-    }
-    ~ArmPhaseTimer() {
-        if (++g_armPhaseCalls < 600) return;
-        char line[900]; int at = 0;
-        for (int i = 0; i < 13; ++i)
-            at += sprintf_s(line + at, sizeof(line) - at, "%s%s %.2f", i ? ", " : "", kArmPhaseNames[i],
-                            g_armPhaseMs[i] / g_armPhaseCalls);
-        Log("[perf] arm phases, mean ms per call: %s", line);
-        memset(g_armPhaseMs, 0, sizeof(g_armPhaseMs));
-        g_armPhaseCalls = 0;
-    }
-};
-
 static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, void* result)
 {
     if (!g_origUpdate1pArms) return;
