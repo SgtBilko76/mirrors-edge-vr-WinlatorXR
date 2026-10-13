@@ -293,6 +293,9 @@ static void LatchFrame(DWORD waitMs)
     ReleaseSRWLockExclusive(&g_lock);
 }
 
+// Packets received so far: WinlatorXR sends one per headset frame, just before it reads the window.
+static long PacketCount() { return InterlockedCompareExchange((volatile LONG*)&g_packets, 0, 0); }
+
 static Packet Frame()
 {
     AcquireSRWLockShared(&g_lock);

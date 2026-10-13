@@ -194,6 +194,10 @@ static bool VrMenuLayer(XrCompositionLayerQuad* layer);
 static void VrMenuResolveEngine();
 #if MEVR_WINLATORXR
 static void WxrSubmitFrame(IDirect3DDevice9* dev);
+static void WxrBeforeRealPresent();
+static void WxrAfterRealPresent();
+static bool  g_wxrPacing = true;           // see WxrBeforeRealPresent (winlatorxr_frame.inl)
+static DWORD g_wxrPaceMarginMs = 2;
 static void WxrReleaseDeviceResources();
 extern bool g_wxrAlternateEye;
 static bool g_wxrBlockKeyboardMouse = true;   // WinlatorXrKeyboardMouse = off (default): gamepad only
@@ -27088,7 +27092,13 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
             f, g_poolDefault, g_poolManaged, g_poolSystemMem, g_poolScratch);
     }
 #if MEVR_WINLATORXR
-    if (g_wxrPresentDstValid && !dst) return g_origPresent(dev, nullptr, &g_wxrPresentDst, wnd, dirty);
+    if (g_xrReady) WxrBeforeRealPresent();
+    {
+        const HRESULT phr = (g_wxrPresentDstValid && !dst) ? g_origPresent(dev, nullptr, &g_wxrPresentDst, wnd, dirty)
+                                                            : g_origPresent(dev, src, dst, wnd, dirty);
+        if (g_xrReady) WxrAfterRealPresent();
+        return phr;
+    }
 #endif
     return g_origPresent(dev, src, dst, wnd, dirty);
 }
@@ -28281,6 +28291,21 @@ static void LoadSettingsFile()
             g_fastSelfWrite = b;
             Log("[cfg]   WinlatorXrFastWrite = %s  (%s)", b ? "on" : "off",
                 b ? "game memory written directly, WriteProcessMemory on a fault" : "game memory written through WriteProcessMemory");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrPacing") == 0) {
+            if (!SettingBool(val, &b)) { Log("[cfg]   WinlatorXrPacing = %s  (not on/off - ignored)", val); rejected++; continue; }
+            g_wxrPacing = b;
+            Log("[cfg]   WinlatorXrPacing = %s", b ? "on (each eye frame waits until WinlatorXR has taken the previous one)" : "off");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrPaceMarginMs") == 0) {
+            const int m = atoi(val);
+            if (m < 0 || m > 10) { Log("[cfg]   WinlatorXrPaceMarginMs = %s  (0..10 - ignored)", val); rejected++; continue; }
+            g_wxrPaceMarginMs = (DWORD)m;
+            Log("[cfg]   WinlatorXrPaceMarginMs = %d", m);
             applied++;
             continue;
         }

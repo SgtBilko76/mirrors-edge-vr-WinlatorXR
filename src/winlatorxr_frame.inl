@@ -549,6 +549,67 @@ static int WxrStampSync(int eye, int newestSync, long frame)
     return lag == 0 ? newestSync : r.sync;
 }
 
+
+// ---- per-eye frame pacing (WinlatorXrPacing, default on) ----
+//
+// Alternate-eye: WinlatorXR takes the game window once per headset frame (72-90 Hz) and hands it
+// to the eye named in the sync pixel. A frame replaced by the next Present before WinlatorXR has
+// taken it is never shown, and its eye keeps an older picture - that eye judders/ghosts while
+// the head turns. If the two eyes' frames are unevenly spaced (left frame always followed quickly
+// by the right one), the same eye loses out every time. WinlatorXR sends a packet at the start of
+// each headset frame, so "no packet since the last Present" means the frame on screen has not
+// been taken yet; the next Present then waits for one packet plus a small margin.
+static int   g_wxrPresentEye = -1;          // eye of the frame about to be presented, -1 flat
+static long  g_wxrPrevPresentPackets = -1;
+static int   g_wxrPrevPresentEye = -1;
+static LONGLONG g_wxrPrevPresentAt = 0;
+struct WxrPaceStats { long frames, unseen, waited; double shownMs, waitMs; };
+static WxrPaceStats g_wxrPace[2] = {};
+
+static LONGLONG WxrPaceNow() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static double WxrPaceMs(LONGLONG a, LONGLONG b)
+{
+    static double f = 0; if (!f) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); f = (double)q.QuadPart; }
+    return (double)(b - a) * 1000.0 / f;
+}
+
+static void WxrBeforeRealPresent()
+{
+    const int prevEye = g_wxrPrevPresentEye;
+    if (prevEye < 0 || g_wxrPrevPresentPackets < 0 || g_wxrPresentEye < 0) return;
+    WxrPaceStats& s = g_wxrPace[prevEye];
+    ++s.frames;
+    if (wxr::PacketCount() != g_wxrPrevPresentPackets) return;      // already taken
+    ++s.unseen;
+    if (!g_wxrPacing) return;
+    const LONGLONG t0 = WxrPaceNow();
+    for (int i = 0; i < 30 && wxr::PacketCount() == g_wxrPrevPresentPackets; ++i) Sleep(1);
+    if (g_wxrPaceMarginMs) Sleep(g_wxrPaceMarginMs);
+    ++s.waited; s.waitMs += WxrPaceMs(t0, WxrPaceNow());
+}
+
+static void WxrAfterRealPresent()
+{
+    const LONGLONG now = WxrPaceNow();
+    if (g_wxrPrevPresentEye >= 0 && g_wxrPrevPresentAt) g_wxrPace[g_wxrPrevPresentEye].shownMs += WxrPaceMs(g_wxrPrevPresentAt, now);
+    g_wxrPrevPresentAt = now;
+    g_wxrPrevPresentEye = g_wxrPresentEye;
+    g_wxrPrevPresentPackets = wxr::PacketCount();
+}
+
+static void WxrPaceReport()
+{
+    for (int e = 0; e < 2; ++e) {
+        WxrPaceStats& s = g_wxrPace[e];
+        if (s.frames)
+            Log("[pace] %s eye: %ld frames, shown %.1f ms on average, %ld (%.0f%%) would have been replaced before"
+                " WinlatorXR took them%s; waited %ld times, %.1f ms per frame on average",
+                e ? "RIGHT" : "LEFT", s.frames, s.shownMs / s.frames, s.unseen, 100.0 * s.unseen / s.frames,
+                g_wxrPacing ? "" : " (pacing off - they were lost)", s.waited, s.waitMs / s.frames);
+        s = {};
+    }
+}
+
 static void WxrSubmitFrame(IDirect3DDevice9* dev)
 {
     if (!g_xrRunning) return;
@@ -658,6 +719,7 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
         }
     }
     const int stampEye = roomScreen ? flatEye : drawnEye;
+    g_wxrPresentEye = layout == 2 ? drawnEye : -1;
     const int stampSync = layout == 2 ? WxrStampSync(drawnEye, drawn.sync, n) : drawn.sync;
     if (layout != 2) g_wxrDrawnYawSet = false;
     g_wxrYawCorrRad = 0.0f;                  // the next frame's first injection sets its own
@@ -762,6 +824,7 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
             LARGE_INTEGER nowAt, fq; QueryPerformanceCounter(&nowAt); QueryPerformanceFrequency(&fq);
             if (lastAt.QuadPart) WxrProfReport((double)(nowAt.QuadPart - lastAt.QuadPart) * 1000.0 / fq.QuadPart, 600);
             WxrStateReport(600);
+            WxrPaceReport();
             lastAt = nowAt;
         }
         const LONG reads = InterlockedExchange(&g_safeReadCalls, 0), faults = InterlockedExchange(&g_safeReadFaults, 0);
