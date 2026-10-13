@@ -95,6 +95,6 @@ static void VrControlsTick()
     if(previous!=input||fabsf(current-last)>.01f){previous=input;base=current;}
     const float wanted=base*(allowed&&!g_snapTurning?g_smoothTurnSpeed:1.f);
     SIZE_T wrote=0;
-    if(current==wanted||(WriteProcessMemory(GetCurrentProcess(),(void*)address,&wanted,4,&wrote)&&wrote==4))last=wanted;
+    if(current==wanted||(SelfWrite((void*)address,&wanted,4,&wrote)&&wrote==4))last=wanted;
     else last=current;
 }

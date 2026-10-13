@@ -609,6 +609,9 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
         const LONG reads = InterlockedExchange(&g_safeReadCalls, 0), faults = InterlockedExchange(&g_safeReadFaults, 0);
         Log("[perf] memory reads: %ld per frame (%s), %ld faulted over 600 frames",
             reads / 600, g_fastSafeRead ? "direct" : "ReadProcessMemory", faults);
+        const LONG writes = InterlockedExchange(&g_selfWriteCalls, 0), fallbacks = InterlockedExchange(&g_selfWriteFallbacks, 0);
+        Log("[perf] memory writes: %ld per frame (%s), %ld needed WriteProcessMemory over 600 frames",
+            writes / 600, g_fastSelfWrite ? "direct" : "WriteProcessMemory", fallbacks);
         // What each call costs on this machine, 1000 of each, on the render thread.
         LARGE_INTEGER qf, t0, t1, t2, t3;
         QueryPerformanceFrequency(&qf);

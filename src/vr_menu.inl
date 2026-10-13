@@ -278,7 +278,7 @@ static void VrMenuReticleTick() {
     const uint32_t wanted=g_showReticle?bits&~g_menuReticleMask:bits|g_menuReticleMask;
     if(wanted==bits)return;
     SIZE_T wrote=0;
-    if(WriteProcessMemory(GetCurrentProcess(),(void*)(hud+g_menuReticleOffset),&wanted,4,&wrote)&&wrote==4)
+    if(SelfWrite((void*)(hud+g_menuReticleOffset),&wanted,4,&wrote)&&wrote==4)
         Log("[hud] native aiming reticle %s",g_showReticle?"enabled":"disabled");
 }
 static int MenuPaused() {
@@ -298,7 +298,7 @@ static void VrMenuFrameCapTick() {
     if(!SafeU32(g_engineObj+g_smoothFlagOffset,&current))return;
     const uint32_t wanted=g_fpsCap==0?current&~g_smoothFlagMask:current|g_smoothFlagMask;
     SIZE_T wrote=0;
-    const bool ok=current==wanted || (WriteProcessMemory(GetCurrentProcess(),
+    const bool ok=current==wanted || (SelfWrite(
         (void*)(g_engineObj+g_smoothFlagOffset),&wanted,sizeof(wanted),&wrote) && wrote==sizeof(wanted));
     g_menuUnlimitedFailed=g_fpsCap==0 && !ok;
 }

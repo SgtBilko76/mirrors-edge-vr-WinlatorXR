@@ -1161,6 +1161,8 @@ extern int g_offSprintRadiusLimit;
 extern int g_offSprintHeightLimit;
 extern int g_offWalkRadiusLimit;
 static bool SafeRead(uintptr_t addr, void* out, size_t n);
+// Own-process write: direct where the page allows it, WriteProcessMemory otherwise. See SafeReadFast.
+static BOOL SelfWrite(LPVOID addr, LPCVOID data, SIZE_T n, SIZE_T* wrote);
 static bool FiniteVec(const MEVR_Vec3& v);
 
 // Live debug calibration in degrees, [left/right][pitch/yaw/roll]. Preserve the values measured
@@ -3459,7 +3461,7 @@ static void PkClimbCameraCollision(bool onPipe)
         if (w & kClimbViewFlags) {
             const uint32_t off = w & ~kClimbViewFlags;
             SIZE_T wrote = 0;
-            WriteProcessMemory(GetCurrentProcess(), (LPVOID)(obj + 0x4C), &off, sizeof(off),
+            SelfWrite( (LPVOID)(obj + 0x4C), &off, sizeof(off),
                                &wrote);
         }
     } else if (g_pkClimbFlagsHeld) {
@@ -3468,7 +3470,7 @@ static void PkClimbCameraCollision(bool onPipe)
         const uint32_t restored = (w & ~kClimbViewFlags) |
                                   (g_pkClimbFlagsSaved & kClimbViewFlags);
         SIZE_T wrote = 0;
-        WriteProcessMemory(GetCurrentProcess(), (LPVOID)(obj + 0x4C), &restored,
+        SelfWrite( (LPVOID)(obj + 0x4C), &restored,
                            sizeof(restored), &wrote);
         g_pkClimbFlagsHeld = false;
         Log("[climb] view flags restored on leaving the pipe");
@@ -5780,7 +5782,7 @@ static void ParkourDirectBodyTick()
         // there instead.
         if (g_pkLastGoodOk) {
             SIZE_T back = 0;
-            WriteProcessMemory(GetCurrentProcess(),
+            SelfWrite(
                                (LPVOID)(g_playerPawn + g_offActorLocation),
                                g_pkLastGood, sizeof(g_pkLastGood), &back);
             Log("[pkdirect] ledge ended - pawn restored to (%.0f %.0f %.0f), the last place the"
@@ -5962,7 +5964,7 @@ static void ParkourDirectBodyTick()
         }
     }
     SIZE_T wrote = 0;
-    if (!WriteProcessMemory(GetCurrentProcess(), (LPVOID)(g_playerPawn + g_offActorLocation),
+    if (!SelfWrite( (LPVOID)(g_playerPawn + g_offActorLocation),
                             want3, sizeof(want3), &wrote) || wrote != sizeof(want3)) {
         Log("[pkdirect] write failed - standing down");
         g_pkDirectBody = false;
@@ -6119,7 +6121,7 @@ static void PkReadSwing()
         // reloading actually turns it off rather than leaving the last scaled value in place.
         const float want = g_pkExitOrig * g_pkExitBoost;
         if (fabsf(g_pkExitVel - want) > 0.5f && std::isfinite(want)) {
-            WriteProcessMemory(GetCurrentProcess(), (LPVOID)(obj + g_offExitVel),
+            SelfWrite( (LPVOID)(obj + g_offExitVel),
                                &want, sizeof(want), nullptr);
             g_pkExitVel = want;
             Log("[bar] PK.51: ExitVelocityModifier %.0f -> %.0f (original %.0f x boost %.2f)",
@@ -9829,6 +9831,41 @@ static bool SafeReadFast(uintptr_t addr, void* out, size_t n)
     return true;
 }
 
+// WriteProcessMemory on its own process measured ~36 us a call under desktop Wine (a wineserver
+// round trip), 350x a read, and the arm IK writes bones with it every frame. The game's data
+// pages are writable, so copy directly; a fault (read-only page, bad address) falls back to
+// WriteProcessMemory, which also handles protection. Faults are rare here: every target was
+// just read. WinlatorXrFastWrite = off restores WriteProcessMemory everywhere.
+#if MEVR_WINLATORXR
+static bool g_fastSelfWrite = true;
+#else
+static const bool g_fastSelfWrite = false;
+#endif
+static volatile LONG g_selfWriteCalls = 0, g_selfWriteFallbacks = 0;
+
+static bool SelfWriteDirect(LPVOID addr, LPCVOID data, SIZE_T n)
+{
+    const uintptr_t a = (uintptr_t)addr;
+    if (a < 0x10000 || a + n < a || a + n > 0xFFFF0000u) return false;
+    __try {
+        g_safeReadCopy(addr, data, n);
+    } __except (SafeReadFilter(GetExceptionCode())) {
+        return false;
+    }
+    return true;
+}
+
+static BOOL SelfWrite(LPVOID addr, LPCVOID data, SIZE_T n, SIZE_T* wrote)
+{
+    g_selfWriteCalls++;
+    if (g_fastSelfWrite && SelfWriteDirect(addr, data, n)) {
+        if (wrote) *wrote = n;
+        return TRUE;
+    }
+    if (g_fastSelfWrite) g_selfWriteFallbacks++;
+    return WriteProcessMemory(GetCurrentProcess(), addr, data, n, wrote);
+}
+
 static bool SafeRead(uintptr_t addr, void* out, size_t n)
 {
     g_safeReadCalls++;
@@ -12995,7 +13032,7 @@ static uintptr_t FindSwanNeck()
 static bool WriteF32(uintptr_t addr, float v)
 {
     SIZE_T wrote = 0;
-    return WriteProcessMemory(GetCurrentProcess(), (LPVOID)addr, &v, 4, &wrote) && wrote == 4;
+    return SelfWrite( (LPVOID)addr, &v, 4, &wrote) && wrote == 4;
 }
 
 static void ApplySwanNeck()
@@ -14195,7 +14232,7 @@ static void ApplyHeadTracking(XrTime when)
         rot[0] = p;
     }
     SIZE_T wrote = 0;
-    WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + g_offActorRotation), rot,
+    SelfWrite( (LPVOID)(ctl + g_offActorRotation), rot,
                        sizeof(int32_t) * 2, &wrote);
 
     g_lastYawWrite = dYaw;      // for the climb telemetry - see the drift note there
@@ -16115,7 +16152,7 @@ static bool WriteRigBytes(uintptr_t address, const void* data, size_t size)
 {
     if (!address || !data || !size) return false;
     SIZE_T wrote = 0;
-    return WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, data, size, &wrote) &&
+    return SelfWrite( (LPVOID)address, data, size, &wrote) &&
            wrote == size;
 }
 
@@ -26806,7 +26843,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
                     SIZE_T wr = 0;
                     auto putOrig = [&](int off) {
                         if (off >= 0)
-                            WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + off),
+                            SelfWrite( (LPVOID)(ctl + off),
                                                &fovPreForce, sizeof(float), &wr);
                     };
                     putOrig(g_offDesiredFOV);
@@ -26848,7 +26885,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
             SIZE_T wrote = 0;
             auto put = [&](int off) {
                 if (off >= 0)
-                    WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + off),
+                    SelfWrite( (LPVOID)(ctl + off),
                                        &want, sizeof(float), &wrote);
             };
             float cur = 0.0f;
@@ -26885,7 +26922,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         if (SafeRead(g_engineObj + g_offMaxSmoothFps, &cur, sizeof(float)) &&
             fabsf(cur - g_fpsCap) > 0.5f) {
             SIZE_T wrote = 0;
-            WriteProcessMemory(GetCurrentProcess(), (LPVOID)(g_engineObj + g_offMaxSmoothFps),
+            SelfWrite( (LPVOID)(g_engineObj + g_offMaxSmoothFps),
                                &g_fpsCap, sizeof(float), &wrote);
             static long n = 0;
             if (++n == 1 || (n % 60) == 0)
@@ -26933,7 +26970,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
             fabsf(cur - 1.0f) > 0.01f) {
             const float pinned = 1.0f;
             SIZE_T wrote = 0;
-            WriteProcessMemory(GetCurrentProcess(),
+            SelfWrite(
                                (LPVOID)(uintptr_t)(g_clientObj + (uint32_t)g_offMinDesiredFps),
                                &pinned, sizeof(float), &wrote);
             static long n = 0;
@@ -28010,6 +28047,14 @@ static void LoadSettingsFile()
             else if (_stricmp(val, "game") == 0) g_wxrGraphicsProfile = false;
             else { Log("[cfg]   WinlatorXrGraphics = %s  (quest or game - ignored)", val); rejected++; continue; }
             Log("[cfg]   WinlatorXrGraphics = %s", g_wxrGraphicsProfile ? "quest" : "game");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrFastWrite") == 0) {
+            if (!SettingBool(val, &b)) { Log("[cfg]   WinlatorXrFastWrite = %s  (not on/off - ignored)", val); rejected++; continue; }
+            g_fastSelfWrite = b;
+            Log("[cfg]   WinlatorXrFastWrite = %s  (%s)", b ? "on" : "off",
+                b ? "game memory written directly, WriteProcessMemory on a fault" : "game memory written through WriteProcessMemory");
             applied++;
             continue;
         }
