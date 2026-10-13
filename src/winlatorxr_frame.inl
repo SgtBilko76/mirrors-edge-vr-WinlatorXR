@@ -412,6 +412,8 @@ static void WxrUpdateFlatMode(long frame)
     else if (!g_wxrFlat && stereoWasOn) { stereoWasOn = false; g_stereoMode = 1; }
 }
 
+#include "winlatorxr_cpu.inl"
+
 static void WxrSubmitFrame(IDirect3DDevice9* dev)
 {
     if (!g_xrRunning) return;
@@ -422,6 +424,7 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
             (unsigned long)g_wxrSyncWaitMs);
     }
     WxrKeepWindowPinned(dev, n);
+    WxrCpuTick(n);
     WxrUpdateFlatMode(n);
 
     IDirect3DSurface9* bb = nullptr;

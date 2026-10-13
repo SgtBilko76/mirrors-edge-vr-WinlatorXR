@@ -201,6 +201,7 @@ static bool g_wxrBlockKeyboardMouse = true;   // WinlatorXrKeyboardMouse = off (
 // then shows the backbuffer 1:1 centred with black bars, instead of stretched over the window.
 static RECT g_wxrPresentDst{};
 static bool g_wxrPresentDstValid = false;
+static bool g_wxrCpuPin = true;              // WinlatorXrCpuPin = on (default): heavy threads on the fast cores
 static bool g_wxrRoomScreen = false;          // WinlatorXrMenuScreen = flat (default): WinlatorXR's own 2D screen; room = curved screen drawn by the mod
 static void WxrInstallInputBlock();
 // Counted on the render thread while scene constants get their eye offset; read at Present.
@@ -28105,6 +28106,14 @@ static void LoadSettingsFile()
             g_fastSelfWrite = b;
             Log("[cfg]   WinlatorXrFastWrite = %s  (%s)", b ? "on" : "off",
                 b ? "game memory written directly, WriteProcessMemory on a fault" : "game memory written through WriteProcessMemory");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrCpuPin") == 0) {
+            if (!SettingBool(val, &b)) { Log("[cfg]   WinlatorXrCpuPin = %s  (not on/off - ignored)", val); rejected++; continue; }
+            g_wxrCpuPin = b;
+            Log("[cfg]   WinlatorXrCpuPin = %s  (%s)", b ? "on" : "off",
+                b ? "game, render and DXVK threads kept on the fastest cores" : "threads left to the scheduler");
             applied++;
             continue;
         }
