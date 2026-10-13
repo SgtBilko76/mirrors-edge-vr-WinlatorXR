@@ -226,3 +226,25 @@ cutscenes, pause) the game's own frame goes untouched to WinlatorXR's 2D screen
 frame in a 1792x1624 container), Present gets a centred destination rect, so the frame is shown
 1:1 with black bars instead of stretched. Stereo starts when the player is in control, as before.
 `WinlatorXrMenuScreen = room` brings back the curved screen. Headset check pending.
+
+## Frame rate on the headset (2026-10-13)
+
+Measured with per-call probes and per-phase arm-update timings in the log (`[perf]` lines):
+
+| Cost on the Quest (Box64 + Proton 9 Wine) | Per call |
+|---|---|
+| ReadProcessMemory (own process) | 1.2-1.8 us |
+| WriteProcessMemory (own process) | 80-480 us |
+| VirtualQuery | 2.2-3.0 us |
+| page-checked direct read | 0.3 us |
+
+The mod made 7,000-36,000 reads and 70-130 writes a frame, which put the arm update at 25 ms.
+Direct writes with a WriteProcessMemory fallback (`WinlatorXrFastWrite`) and page-checked direct
+reads (`WinlatorXrReadCache`) cut it to 2.6 ms. A plain SEH-guarded read (`WinlatorXrFastRead`)
+is NOT usable as the default: every fault costs so much under Box64 that the object scan
+stalled and stereo never started.
+
+That alone did not move the frame rate (12-21 fps side by side): the GPU stayed at ~45%, and the
+frame rate without stereo is 25-37 fps, so duplicated draw calls on the CPU are the limit.
+`AlternateEye = on` gave ~35-42 fps in the headset (user: "a little ghosting, but better") and
+is now the default in this flavour.

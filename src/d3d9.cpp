@@ -21984,7 +21984,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
 bool         g_simulStereo = false;
 #if MEVR_WINLATORXR
 // AlternateEye in mevr.ini: arm alternate-eye instead of side-by-side on the headset.
-bool         g_wxrAlternateEye = false;
+bool         g_wxrAlternateEye = true;    // headset 2026-10-13: ~40 fps against 13-15 side by side
 #endif          // F10 toggles; alternate-eye remains the fallback
 static bool  g_inDupDraw = false;            // re-entrancy guard
 float        g_sceneMat[16] = { 0 };         // last scene matrix seen at c0, UNMODIFIED
