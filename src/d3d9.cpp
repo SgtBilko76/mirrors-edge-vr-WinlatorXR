@@ -662,6 +662,11 @@ static void WxrApplyQuestGraphics()
         { "Distortion", "False" }, { "LensFlares", "False" },
         { "DetailMode", "1" }, { "MaxShadowResolution", "256" }, { "MaxAnisotropy", "2" },
         { "SkeletalMeshLODBias", "1" }, { "ParticleLODBias", "1" }, { "UseVsync", "False" },
+        // Game defaults (BaseEngine.ini), restored after the 2026-10-13 "low" experiment wrote
+        // them down: it looked worse and gained no frame rate on the headset.
+        { "DynamicLights", "True" }, { "CompositeDynamicLights", "False" }, { "DynamicDecals", "True" },
+        { "FogVolumes", "True" }, { "DirectionalLightmaps", "True" }, { "QualityBloom", "True" },
+        { "FoliageDrawRadiusMultiplier", "1.000000" },
     };
     const int kCount = (int)(sizeof(kKeys) / sizeof(kKeys[0]));
     wchar_t path[MAX_PATH];
