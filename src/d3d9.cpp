@@ -27346,6 +27346,128 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDS(IDirect3DDevice9* dev, UINT w, UI
 }
 
 
+#if MEVR_WINLATORXR
+// ---- render-thread profiler (WinlatorXrProfile, default on while the bottleneck is hunted) ----
+//
+// Headset 2026-10-13: the render thread runs at ~90% of a core and sets the frame rate. Its time
+// splits three ways: the mod's hooks, the D3D9 calls DXVK translates (all x86 code under Box64),
+// and the engine's own render-thread code. Every hooked draw/state entry point gets an OUTER
+// timer around the mod's hook and an INNER timer around the original DXVK call, so
+// outer - inner is the mod's own cost; a set of heavy state calls the mod does not hook gets an
+// outer timer only (pure DXVK cost). One call in 8 is timed and scaled, keeping the timers'
+// own cost (QueryPerformanceCounter ~0.45 us on the headset) small.
+static bool g_wxrProfile = true;
+struct WxrProfSlot { const char* name; void* outerReal; void* innerReal; double outerMs, innerMs; long calls; bool hooked; };
+static WxrProfSlot g_wxrProf[120];
+static double g_wxrProfTick = 0.0;     // ms per QPC tick
+
+static inline bool WxrProfSample(WxrProfSlot& s) { return ((++s.calls) & 7) == 0; }
+static inline LONGLONG WxrQpc() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+
+template<int S, typename... A>
+static HRESULT STDMETHODCALLTYPE WxrProfOuter(IDirect3DDevice9* d, A... a)
+{
+    WxrProfSlot& s = g_wxrProf[S];
+    typedef HRESULT (STDMETHODCALLTYPE* Fn)(IDirect3DDevice9*, A...);
+    if (!WxrProfSample(s)) return ((Fn)s.outerReal)(d, a...);
+    const LONGLONG t0 = WxrQpc();
+    const HRESULT hr = ((Fn)s.outerReal)(d, a...);
+    s.outerMs += (double)(WxrQpc() - t0) * g_wxrProfTick * 8.0;
+    return hr;
+}
+template<int S, typename... A>
+static HRESULT STDMETHODCALLTYPE WxrProfInner(IDirect3DDevice9* d, A... a)
+{
+    WxrProfSlot& s = g_wxrProf[S];
+    typedef HRESULT (STDMETHODCALLTYPE* Fn)(IDirect3DDevice9*, A...);
+    // Sampled on the same calls as the outer timer: the inner call of a timed outer call.
+    if ((s.calls & 7) != 0) return ((Fn)s.innerReal)(d, a...);
+    const LONGLONG t0 = WxrQpc();
+    const HRESULT hr = ((Fn)s.innerReal)(d, a...);
+    s.innerMs += (double)(WxrQpc() - t0) * g_wxrProfTick * 8.0;
+    return hr;
+}
+
+// Outer-only wrapper on an unhooked slot.
+template<int S, typename... A>
+static void WxrProfWrap(IDirect3DDevice9* dev, const char* name, HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*, A...))
+{
+    g_wxrProf[S].name = name;
+    g_wxrProf[S].outerReal = PatchVTable(dev, S, (void*)&WxrProfOuter<S, A...>);
+}
+// Outer + inner on a slot the mod hooks; `orig` is the mod's g_orig pointer for it.
+template<int S, typename... A, typename P>
+static void WxrProfWrapHooked(IDirect3DDevice9* dev, const char* name, P* orig, HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*, A...))
+{
+    g_wxrProf[S].name = name;
+    g_wxrProf[S].hooked = true;
+    g_wxrProf[S].outerReal = PatchVTable(dev, S, (void*)&WxrProfOuter<S, A...>);   // = the mod's hook
+    g_wxrProf[S].innerReal = (void*)*orig;                                         // = DXVK
+    *orig = (P)(void*)&WxrProfInner<S, A...>;
+}
+
+static void WxrInstallProfiler(IDirect3DDevice9* dev)
+{
+    if (!g_wxrProfile) { Log("[prof] render-thread profiler off (WinlatorXrProfile = off)"); return; }
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_wxrProfTick = 1000.0 / (double)f.QuadPart;
+    typedef IDirect3DDevice9 D;
+    WxrProfWrapHooked<DEV_DrawPrimitive>(dev, "DrawPrimitive", &g_origDrawPrim, (HRESULT (STDMETHODCALLTYPE*)(D*, D3DPRIMITIVETYPE, UINT, UINT))nullptr);
+    WxrProfWrapHooked<DEV_DrawIndexedPrimitive>(dev, "DrawIndexedPrimitive", &g_origDrawIndexed, (HRESULT (STDMETHODCALLTYPE*)(D*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT))nullptr);
+    WxrProfWrapHooked<DEV_DrawPrimitiveUP>(dev, "DrawPrimitiveUP", &g_origDrawPrimUP, (HRESULT (STDMETHODCALLTYPE*)(D*, D3DPRIMITIVETYPE, UINT, const void*, UINT))nullptr);
+    WxrProfWrapHooked<DEV_DrawIndexedPrimitiveUP>(dev, "DrawIndexedPrimitiveUP", &g_origDrawIndexedUP, (HRESULT (STDMETHODCALLTYPE*)(D*, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT, const void*, UINT))nullptr);
+    WxrProfWrapHooked<DEV_SetVertexShaderConstantF>(dev, "SetVertexShaderConstantF", &g_origSetVSConstF, (HRESULT (STDMETHODCALLTYPE*)(D*, UINT, const float*, UINT))nullptr);
+    WxrProfWrapHooked<DEV_SetRenderTarget>(dev, "SetRenderTarget", &g_origSetRenderTarget, (HRESULT (STDMETHODCALLTYPE*)(D*, DWORD, IDirect3DSurface9*))nullptr);
+    WxrProfWrapHooked<DEV_Clear>(dev, "Clear", &g_origClear, (HRESULT (STDMETHODCALLTYPE*)(D*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD))nullptr);
+    WxrProfWrapHooked<DEV_StretchRect>(dev, "StretchRect", &g_origStretchRect, (HRESULT (STDMETHODCALLTYPE*)(D*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*, const RECT*, D3DTEXTUREFILTERTYPE))nullptr);
+    // Not hooked by the mod: pure DXVK cost.
+    WxrProfWrap<57>(dev, "SetRenderState", (HRESULT (STDMETHODCALLTYPE*)(D*, D3DRENDERSTATETYPE, DWORD))nullptr);
+    WxrProfWrap<65>(dev, "SetTexture", (HRESULT (STDMETHODCALLTYPE*)(D*, DWORD, IDirect3DBaseTexture9*))nullptr);
+    WxrProfWrap<69>(dev, "SetSamplerState", (HRESULT (STDMETHODCALLTYPE*)(D*, DWORD, D3DSAMPLERSTATETYPE, DWORD))nullptr);
+    WxrProfWrap<87>(dev, "SetVertexDeclaration", (HRESULT (STDMETHODCALLTYPE*)(D*, IDirect3DVertexDeclaration9*))nullptr);
+    WxrProfWrap<92>(dev, "SetVertexShader", (HRESULT (STDMETHODCALLTYPE*)(D*, IDirect3DVertexShader9*))nullptr);
+    WxrProfWrap<100>(dev, "SetStreamSource", (HRESULT (STDMETHODCALLTYPE*)(D*, UINT, IDirect3DVertexBuffer9*, UINT, UINT))nullptr);
+    WxrProfWrap<104>(dev, "SetIndices", (HRESULT (STDMETHODCALLTYPE*)(D*, IDirect3DIndexBuffer9*))nullptr);
+    WxrProfWrap<107>(dev, "SetPixelShader", (HRESULT (STDMETHODCALLTYPE*)(D*, IDirect3DPixelShader9*))nullptr);
+    WxrProfWrap<109>(dev, "SetPixelShaderConstantF", (HRESULT (STDMETHODCALLTYPE*)(D*, UINT, const float*, UINT))nullptr);
+    WxrProfWrap<47>(dev, "SetViewport", (HRESULT (STDMETHODCALLTYPE*)(D*, const D3DVIEWPORT9*))nullptr);
+    WxrProfWrap<75>(dev, "SetScissorRect", (HRESULT (STDMETHODCALLTYPE*)(D*, const RECT*))nullptr);
+    WxrProfWrap<39>(dev, "SetDepthStencilSurface", (HRESULT (STDMETHODCALLTYPE*)(D*, IDirect3DSurface9*))nullptr);
+    Log("[prof] render-thread profiler installed on %d entry points (1 call in 8 timed)", 20);
+}
+
+// Called from WxrSubmitFrame every 600 frames with the wall time those frames took.
+static void WxrProfReport(double wallMs, long frames)
+{
+    if (!g_wxrProfile || !g_wxrProfTick || frames <= 0) return;
+    double modMs = 0, dxvkMs = 0;
+    char line[1600]; int at = 0;
+    struct Row { int s; double cost; };
+    Row rows[120]; int n = 0;
+    for (int s = 0; s < 120; ++s) {
+        WxrProfSlot& p = g_wxrProf[s];
+        if (!p.name || !p.calls) continue;
+        const double mod = p.hooked ? (std::max)(0.0, p.outerMs - p.innerMs) : 0.0;
+        const double dx = p.hooked ? p.innerMs : p.outerMs;
+        modMs += mod; dxvkMs += dx;
+        rows[n++] = { s, p.outerMs };
+    }
+    std::sort(rows, rows + n, [](const Row& a, const Row& b) { return a.cost > b.cost; });
+    for (int i = 0; i < n && i < 12; ++i) {
+        WxrProfSlot& p = g_wxrProf[rows[i].s];
+        at += sprintf_s(line + at, sizeof(line) - at, "%s%s %ld/f %.2f ms%s", i ? ", " : "", p.name,
+                        p.calls / frames, p.outerMs / frames,
+                        p.hooked ? "" : "");
+        if (p.hooked) at += sprintf_s(line + at, sizeof(line) - at, " (mod %.2f)", (std::max)(0.0, p.outerMs - p.innerMs) / frames);
+    }
+    const double frameMs = wallMs / frames;
+    Log("[prof] render thread per frame: %.1f ms wall | mod hooks %.2f ms | DXVK in profiled calls %.2f ms |"
+        " rest (engine code, Present, unprofiled calls) %.1f ms", frameMs, modMs / frames, dxvkMs / frames,
+        frameMs - (modMs + dxvkMs) / frames);
+    Log("[prof]   by call: %s", line);
+    for (int s = 0; s < 120; ++s) { g_wxrProf[s].outerMs = g_wxrProf[s].innerMs = 0; g_wxrProf[s].calls = 0; }
+}
+#endif
+
 static void PatchDeviceOnce(IDirect3DDevice9* dev)
 {
     if (g_devicePatched || !dev) return;
@@ -27393,6 +27515,9 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
     if (!g_origPresent || !g_origReset || !g_origCreateTex || !g_origCreateVB ||
         !g_origCreateIB || !g_origClear)
         Log("[patch] *** ONE OR MORE ORIGINALS ARE NULL - a patch failed, expect a crash ***");
+#if MEVR_WINLATORXR
+    WxrInstallProfiler(dev);
+#endif
 }
 
 // ================================================================ a resolution off the menu
@@ -28154,6 +28279,13 @@ static void LoadSettingsFile()
             g_fastSelfWrite = b;
             Log("[cfg]   WinlatorXrFastWrite = %s  (%s)", b ? "on" : "off",
                 b ? "game memory written directly, WriteProcessMemory on a fault" : "game memory written through WriteProcessMemory");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrProfile") == 0) {
+            if (!SettingBool(val, &b)) { Log("[cfg]   WinlatorXrProfile = %s  (not on/off - ignored)", val); rejected++; continue; }
+            g_wxrProfile = b;
+            Log("[cfg]   WinlatorXrProfile = %s", b ? "on" : "off");
             applied++;
             continue;
         }

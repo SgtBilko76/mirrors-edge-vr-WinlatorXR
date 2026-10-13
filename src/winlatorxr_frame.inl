@@ -756,6 +756,12 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
         Log("[wxr] frame %ld: %.1f fps, %ld packets (%ld rejected%s%s), sync %d, %s",
             n, 1.0e9 / periodNs, packets, rejected, rejected ? ", first: " : "", rejected ? bad : "",
             drawn.sync, layout == 1 ? "side-by-side" : layout == 2 ? "alternate-eye" : "flat");
+        {
+            static LARGE_INTEGER lastAt{};
+            LARGE_INTEGER nowAt, fq; QueryPerformanceCounter(&nowAt); QueryPerformanceFrequency(&fq);
+            if (lastAt.QuadPart) WxrProfReport((double)(nowAt.QuadPart - lastAt.QuadPart) * 1000.0 / fq.QuadPart, 600);
+            lastAt = nowAt;
+        }
         const LONG reads = InterlockedExchange(&g_safeReadCalls, 0), faults = InterlockedExchange(&g_safeReadFaults, 0);
         const LONG queries = InterlockedExchange(&g_readCacheQueries, 0);
         Log("[perf] memory reads: %ld per frame (%s), %ld faulted, %ld page checks over 600 frames",
@@ -764,35 +770,8 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
         const LONG writes = InterlockedExchange(&g_selfWriteCalls, 0), fallbacks = InterlockedExchange(&g_selfWriteFallbacks, 0);
         Log("[perf] memory writes: %ld per frame (%s), %ld needed WriteProcessMemory over 600 frames",
             writes / 600, g_fastSelfWrite ? "direct" : "WriteProcessMemory", fallbacks);
-        // What each call costs on this machine, 1000 of each, on the render thread.
-        LARGE_INTEGER qf, t0, t1, t2, t3;
-        QueryPerformanceFrequency(&qf);
-        uint32_t probe = 0;
-        const uintptr_t at = (uintptr_t)&g_xrFrames;
-        QueryPerformanceCounter(&t0);
-        for (int i = 0; i < 1000; ++i) { SIZE_T got; ReadProcessMemory(GetCurrentProcess(), (LPCVOID)at, &probe, 4, &got); }
-        QueryPerformanceCounter(&t1);
-        for (int i = 0; i < 1000; ++i) SafeReadFast(at, &probe, 4);
-        QueryPerformanceCounter(&t2);
-        for (int i = 0; i < 1000; ++i) GetAsyncKeyState(VK_F1 + (i & 7));
-        QueryPerformanceCounter(&t3);
-        LARGE_INTEGER t4, t5;
-        static volatile uint32_t sink = 0;
-        for (int i = 0; i < 1000; ++i) { uint32_t v = (uint32_t)i; SIZE_T w; WriteProcessMemory(GetCurrentProcess(), (LPVOID)&sink, &v, 4, &w); }
-        QueryPerformanceCounter(&t4);
-        for (int i = 0; i < 1000; ++i) (void)NowMs();
-        QueryPerformanceCounter(&t5);
-        LARGE_INTEGER t6, t7;
-        MEMORY_BASIC_INFORMATION qm;
-        for (int i = 0; i < 1000; ++i) VirtualQuery((LPCVOID)at, &qm, sizeof(qm));
-        QueryPerformanceCounter(&t6);
-        for (int i = 0; i < 1000; ++i) SafeReadCached(at, &probe, 4);
-        QueryPerformanceCounter(&t7);
-        const double us = 1.0e6 / (double)qf.QuadPart / 1000.0;
-        Log("[perf] per call: ReadProcessMemory %.2f us, direct read %.3f us, GetAsyncKeyState %.2f us,"
-            " WriteProcessMemory %.2f us, NowMs %.2f us, VirtualQuery %.2f us, cached read %.3f us",
-            (t1.QuadPart - t0.QuadPart) * us, (t2.QuadPart - t1.QuadPart) * us, (t3.QuadPart - t2.QuadPart) * us,
-            (t4.QuadPart - t3.QuadPart) * us, (t5.QuadPart - t4.QuadPart) * us,
-            (t6.QuadPart - t5.QuadPart) * us, (t7.QuadPart - t6.QuadPart) * us);
+        // (The per-call cost probe that stood here ran 1000 WriteProcessMemory calls - up to 0.5 s
+        // on the headset - every 600 frames: a periodic hitch. Its results are in
+        // docs/WINLATORXR_2026-10-06.md.)
     }
 }
