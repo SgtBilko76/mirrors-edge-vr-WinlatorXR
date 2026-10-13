@@ -656,14 +656,17 @@ static bool g_wxrGraphicsProfile = true;
 static void WxrApplyQuestGraphics()
 {
     if (!g_wxrGraphicsProfile) { Log("[wxr] graphics: the game's own settings (WinlatorXrGraphics = game)"); return; }
+    // Since 2026-10-13 only dynamic shadows are switched off (user's choice after testing: the
+    // wider cuts looked worse and gained no frame rate, the limit being the render thread's draw
+    // calls). LightEnvironmentShadows are the dynamic shadows of characters. Every other key is
+    // set back to the game's own default (BaseEngine.ini / DefaultEngine.ini), undoing the
+    // earlier Quest and "low" profiles on an existing TdEngine.ini.
     static const char* const kKeys[][2] = {
         { "DynamicShadows", "False" }, { "LightEnvironmentShadows", "False" },
-        { "MotionBlur", "False" }, { "DepthOfField", "False" }, { "AmbientOcclusion", "False" },
-        { "Distortion", "False" }, { "LensFlares", "False" },
-        { "DetailMode", "1" }, { "MaxShadowResolution", "256" }, { "MaxAnisotropy", "2" },
-        { "SkeletalMeshLODBias", "1" }, { "ParticleLODBias", "1" }, { "UseVsync", "False" },
-        // Game defaults (BaseEngine.ini), restored after the 2026-10-13 "low" experiment wrote
-        // them down: it looked worse and gained no frame rate on the headset.
+        { "MotionBlur", "False" }, { "DepthOfField", "True" }, { "AmbientOcclusion", "False" },
+        { "Distortion", "True" }, { "LensFlares", "True" },
+        { "DetailMode", "2" }, { "MaxShadowResolution", "512" }, { "MaxAnisotropy", "4" },
+        { "SkeletalMeshLODBias", "0" }, { "ParticleLODBias", "0" }, { "UseVsync", "False" },
         { "DynamicLights", "True" }, { "CompositeDynamicLights", "False" }, { "DynamicDecals", "True" },
         { "FogVolumes", "True" }, { "DirectionalLightmaps", "True" }, { "QualityBloom", "True" },
         { "FoliageDrawRadiusMultiplier", "1.000000" },
@@ -718,8 +721,8 @@ static void WxrApplyQuestGraphics()
     DWORD written = 0;
     const bool ok = WriteFile(h2, out.data(), (DWORD)out.size(), &written, nullptr) && written == out.size();
     CloseHandle(h2);
-    Log("*** [wxr] graphics: Quest profile %s - %d of %d keys changed (shadows, DOF, motion blur,"
-        " distortion, AO, lens flares off; detail medium; bloom kept)", ok ? "written" : "write FAILED", changed, kCount);
+    Log("*** [wxr] graphics: Quest profile %s - %d of %d keys changed ("
+        " only dynamic shadows off, the rest at the game's defaults)", ok ? "written" : "write FAILED", changed, kCount);
 }
 #endif
 
