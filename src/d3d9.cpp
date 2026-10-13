@@ -809,6 +809,7 @@ static void* PatchVTable(void* obj, int index, void* repl)
 #if MEVR_WINLATORXR
 #include <process.h>
 #include "winlatorxr.inl"
+#include "winlatorxr_state.inl"
 #endif
 
 static bool InitXR()
@@ -27516,6 +27517,7 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
         !g_origCreateIB || !g_origClear)
         Log("[patch] *** ONE OR MORE ORIGINALS ARE NULL - a patch failed, expect a crash ***");
 #if MEVR_WINLATORXR
+    WxrInstallStateFilter(dev);       // first, so the profiler below measures filter + DXVK
     WxrInstallProfiler(dev);
 #endif
 }
@@ -28279,6 +28281,13 @@ static void LoadSettingsFile()
             g_fastSelfWrite = b;
             Log("[cfg]   WinlatorXrFastWrite = %s  (%s)", b ? "on" : "off",
                 b ? "game memory written directly, WriteProcessMemory on a fault" : "game memory written through WriteProcessMemory");
+            applied++;
+            continue;
+        }
+        if (_stricmp(key, "WinlatorXrStateFilter") == 0) {
+            if (!SettingBool(val, &b)) { Log("[cfg]   WinlatorXrStateFilter = %s  (not on/off - ignored)", val); rejected++; continue; }
+            g_wxrStateFilter = b;
+            Log("[cfg]   WinlatorXrStateFilter = %s", b ? "on (redundant D3D9 state calls dropped before DXVK)" : "off");
             applied++;
             continue;
         }

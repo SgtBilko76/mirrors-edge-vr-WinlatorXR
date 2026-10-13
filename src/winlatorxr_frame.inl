@@ -760,6 +760,7 @@ static void WxrSubmitFrame(IDirect3DDevice9* dev)
             static LARGE_INTEGER lastAt{};
             LARGE_INTEGER nowAt, fq; QueryPerformanceCounter(&nowAt); QueryPerformanceFrequency(&fq);
             if (lastAt.QuadPart) WxrProfReport((double)(nowAt.QuadPart - lastAt.QuadPart) * 1000.0 / fq.QuadPart, 600);
+            WxrStateReport(600);
             lastAt = nowAt;
         }
         const LONG reads = InterlockedExchange(&g_safeReadCalls, 0), faults = InterlockedExchange(&g_safeReadFaults, 0);

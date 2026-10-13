@@ -18,9 +18,15 @@ static void ReleaseEffectShader(EffectShader& entry)
     if(entry.glassStereo)entry.glassStereo->Release();
     entry={};
 }
+#if MEVR_WINLATORXR
+static void ResetPixelHashes();
+#endif
 static void ResetEffectShaders()
 {
     ResetScreenSamplers();
+#if MEVR_WINLATORXR
+    ResetPixelHashes();
+#endif
     for(auto& entry:g_effectShaders)ReleaseEffectShader(entry);
     if(g_hazePixelShader)g_hazePixelShader->Release();
     g_hazePixelShader=nullptr;g_effectPixelHash=0;
@@ -30,13 +36,57 @@ static uint32_t EffectShaderHash(const std::vector<DWORD>& code)
 {
     uint32_t hash=2166136261u;for(DWORD word:code){hash^=word;hash*=16777619u;}return hash;
 }
+#if MEVR_WINLATORXR
+// Per draw this ran up to three times, each a GetVertexShader into DXVK plus a scan of all 256
+// entries - ~3 us a draw on the headset. The bound shader now comes from the state tracker and
+// the entry from a pointer-keyed index (stale slots are rejected by the entry check).
+static unsigned short g_effectShaderIndex[1024];   // entry index + 1, 0 = empty
+static unsigned EffectShaderSlot(const void* p){return (unsigned)(((uintptr_t)p>>4)*2654435761u)>>22;}
+static void IndexEffectShader(EffectShader* e)
+{
+    const unsigned short mine=(unsigned short)(e-g_effectShaders)+1;
+    const unsigned h=EffectShaderSlot(e->shader);
+    for(unsigned probe=0;probe<16;++probe){
+        unsigned short& slot=g_effectShaderIndex[(h+probe)&1023];
+        // Free, already this entry, or stale (its entry now holds a shader that hashes elsewhere).
+        if(!slot||slot==mine||!g_effectShaders[slot-1].shader){slot=mine;return;}
+    }
+    memset(g_effectShaderIndex,0,sizeof(g_effectShaderIndex));     // crowded: rebuild
+    for(auto& entry:g_effectShaders)if(entry.shader){
+        const unsigned hh=EffectShaderSlot(entry.shader);
+        for(unsigned probe=0;probe<16;++probe){
+            unsigned short& slot=g_effectShaderIndex[(hh+probe)&1023];
+            if(!slot){slot=(unsigned short)(&entry-g_effectShaders)+1;break;}
+        }
+    }
+}
+static EffectShader* LookupEffectShader(IDirect3DVertexShader9* shader)
+{
+    const unsigned h=EffectShaderSlot(shader);
+    for(unsigned probe=0;probe<16;++probe){
+        const unsigned short i=g_effectShaderIndex[(h+probe)&1023];
+        if(!i)break;
+        EffectShader& e=g_effectShaders[i-1];
+        if(e.shader==shader&&e.reg==g_vmReg)return &e;
+    }
+    for(auto& entry:g_effectShaders)if(entry.shader==shader&&entry.reg==g_vmReg){IndexEffectShader(&entry);return &entry;}
+    return nullptr;
+}
+#endif
 static EffectShader* FindEffectShader(IDirect3DDevice9* dev)
 {
+#if MEVR_WINLATORXR
+    IDirect3DVertexShader9* shader=WxrCurrentVS(dev);
+    if(!shader)return nullptr;
+    if(EffectShader* hit=LookupEffectShader(shader))return hit;
+    shader->AddRef();                  // the new entry keeps a reference, as the Get used to give
+#else
     IDirect3DVertexShader9* shader=nullptr;
     if(FAILED(dev->GetVertexShader(&shader))||!shader)return nullptr;
     for(auto& entry:g_effectShaders)if(entry.shader==shader&&entry.reg==g_vmReg){
         shader->Release();return &entry;
     }
+#endif
     UINT size=0;std::vector<DWORD> code;
     if(SUCCEEDED(shader->GetFunction(nullptr,&size))&&size>=8&&size<=65536&&!(size%4)){
         code.resize(size/4);if(FAILED(shader->GetFunction(code.data(),&size)))code.clear();
@@ -46,6 +96,9 @@ static EffectShader* FindEffectShader(IDirect3DDevice9* dev)
     ReleaseEffectShader(entry);
     // Keep the COM reference: pointer reuse must never inherit a different shader's verdict.
     entry={shader,g_vmReg,scene,EffectShaderHash(code)};
+#if MEVR_WINLATORXR
+    IndexEffectShader(&entry);
+#endif
     // Exact shaders captured from this executable: InvViewProj c5..8,
     // ViewOrigin c9, POSITION passed through, scene UV in TEXCOORD0.
     if(entry.hash==0x51B6BA4Au){
@@ -68,6 +121,30 @@ static bool WorldUPUsesSceneTransform(IDirect3DDevice9* dev)
 {
     const auto* entry=FindEffectShader(dev);return entry&&entry->scene;
 }
+#if MEVR_WINLATORXR
+// The single-entry cache below thrashed: the bound pixel shader changes every few draws, and
+// every change re-read and re-hashed the whole bytecode (GetFunction twice + FNV) - per draw,
+// under Box64. Now one remembered hash per pixel shader, the shader kept alive by a reference
+// so its address cannot be reused by another while it is in the table.
+struct PixelHashSlot{IDirect3DPixelShader9* shader;uint32_t hash;};
+static PixelHashSlot g_pixelHashes[512];
+static void ResetPixelHashes(){for(auto& s:g_pixelHashes){if(s.shader)s.shader->Release();s={};}}
+static uint32_t CurrentEffectPixelHash(IDirect3DDevice9* dev)
+{
+    IDirect3DPixelShader9* shader=WxrCurrentPS(dev);
+    if(!shader)return 0;
+    PixelHashSlot& slot=g_pixelHashes[((uintptr_t)shader>>4)&511];
+    if(slot.shader==shader)return slot.hash;
+    uint32_t hash=0;UINT size=0;
+    if(SUCCEEDED(shader->GetFunction(nullptr,&size))&&size>=8&&size<=65536&&size%4==0){
+        std::vector<DWORD> code(size/4);
+        if(SUCCEEDED(shader->GetFunction(code.data(),&size)))hash=EffectShaderHash(code);
+    }
+    if(slot.shader)slot.shader->Release();
+    shader->AddRef();slot={shader,hash};
+    return hash;
+}
+#else
 static uint32_t CurrentEffectPixelHash(IDirect3DDevice9* dev)
 {
     IDirect3DPixelShader9* shader=nullptr;
@@ -82,6 +159,7 @@ static uint32_t CurrentEffectPixelHash(IDirect3DDevice9* dev)
     }
     return g_effectPixelHash;
 }
+#endif
 static bool SunHazePixelMatches(IDirect3DDevice9* dev){return CurrentEffectPixelHash(dev)==0xF2935D14u;}
 
 WorldGlassReflection::WorldGlassReflection(IDirect3DDevice9* device):dev(device)
